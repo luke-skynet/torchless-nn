@@ -1,11 +1,11 @@
-from utils import init_random_tensor
+from utils import init_weight_tensor
 from layers import RMSNorm, RotaryEmbedding, Softcap, TransformerBlock, gemma_layer_types
 from activations import GeLU, SoftMax
 from transformer_adapters import GPTEmbedFront, GPTEmbedBack
 from network import Network
 
 
-# The published Gemma 4 31B text configuration, for reference and for scaling down.
+# The published Gemma 4 text configurations, for reference and for scaling down.
 # Sanity check: gemma_parameter_count(**GEMMA_4_31B) lands on the ~30.7B text params
 # implied by the checkpoint's 62,546,177,752 bf16 bytes once the vision tower is set aside.
 GEMMA_4_31B = dict(
@@ -31,12 +31,39 @@ GEMMA_4_31B = dict(
 )
 
 
+# The 12B of the same family: narrower and shallower, and its global layers cut all the
+# way down to a single shared key/value head. gemma_parameter_count(**GEMMA_4_12B) gives
+# 11.91B against the checkpoint's 11,959,730,224 total, the remainder being the projector.
+GEMMA_4_12B = dict(
+    vocab_size            = 262144,
+    context_length        = 262144,
+    num_layers            = 48,
+    embed_dim             = 3840,
+    ffn_multiplier        = 4,        # 15360 intermediate
+    num_heads             = 16,
+    head_dim              = 256,
+    num_kv_heads          = 8,
+    global_head_dim       = 512,
+    num_global_kv_heads   = 1,        # one shared key/value head on global layers
+    sliding_window        = 1024,
+    pattern               = 6,        # 5 sliding : 1 global, 8 global layers of 48
+    local_theta           = 10000.0,
+    global_theta          = 1000000.0,
+    global_partial_rotary = 0.25,
+    logit_softcap         = 30.0,
+    qk_norm               = True,
+    post_norm             = True,
+    kv_shared_global      = True,
+)
+
+
 def gemma_gpt(vocab_size, context_length, num_layers, embed_dim, num_heads, head_dim,
               num_kv_heads, global_head_dim = None, num_global_kv_heads = None,
               sliding_window = 1024, pattern = 6, ffn_multiplier = 4,
               local_theta = 10000.0, global_theta = 1000000.0, global_partial_rotary = 0.25,
               logit_softcap = 30.0, qk_norm = True, post_norm = True, kv_shared_global = True,
-              chunk_size = None, dropout_rate = 0.0, activation = GeLU, embedding_table = None):
+              chunk_size = None, dropout_rate = 0.0, activation = GeLU, embedding_table = None,
+              layer_types = None, rms_norm_eps = 1e-6):
 
     """Assemble a Gemma 4 shaped decoder.
 
@@ -64,16 +91,16 @@ def gemma_gpt(vocab_size, context_length, num_layers, embed_dim, num_heads, head
     if embedding_table is None:
         # scaled so that the sqrt(embed_dim) multiply in GPTEmbedFront lands the
         # embeddings at unit scale on the residual stream
-        embedding_table = init_random_tensor((vocab_size, embed_dim)) / embed_dim**0.5
+        embedding_table = init_weight_tensor((vocab_size, embed_dim), embed_dim**0.5)
 
     local_rope  = RotaryEmbedding(head_dim, context_length, theta = local_theta)
     global_rope = RotaryEmbedding(global_head_dim, context_length, theta = global_theta,
-                                  partial_rotary_factor = global_partial_rotary)
+                                  partial_rotary_factor = global_partial_rotary, proportional = True)
 
     stack = [GPTEmbedFront(embedding_table, context_length,
                            positional = "none", scale_embeddings = True)]
 
-    for kind in gemma_layer_types(num_layers, pattern):
+    for kind in (layer_types if layer_types is not None else gemma_layer_types(num_layers, pattern)):
         is_global = kind == "global"
         stack.append(TransformerBlock(
             embed_dim, context_length, num_heads, activation, decoder = True,
@@ -82,6 +109,8 @@ def gemma_gpt(vocab_size, context_length, num_layers, embed_dim, num_heads, head
             num_kv_heads   = num_global_kv_heads if is_global else num_kv_heads,
             head_dim       = global_head_dim     if is_global else head_dim,
             qk_norm        = qk_norm,
+            attention_scale = 1.0,
+            v_norm         = True,
             rope           = global_rope         if is_global else local_rope,
             sliding_window = None                if is_global else sliding_window,
             kv_shared      = kv_shared_global and is_global,
@@ -95,13 +124,24 @@ def gemma_gpt(vocab_size, context_length, num_layers, embed_dim, num_heads, head
 
     stack.append(SoftMax())
 
-    return Network(stack)
+    # Apply the checkpoint epsilon to residual norms and per-head Q/K/V norms.
+    for layer in stack:
+        norms = [layer] if isinstance(layer, RMSNorm) else []
+        if isinstance(layer, TransformerBlock):
+            norms += [n for n in layer.blocks if isinstance(n, RMSNorm)]
+            norms += [layer.attn_block.q_norm, layer.attn_block.k_norm, layer.attn_block.v_norm]
+        for norm in norms:
+            if norm is not None:
+                norm.eps = rms_norm_eps
+    model = Network(stack)
+    model.context_length = context_length
+    return model
 
 
 def gemma_parameter_count(vocab_size, num_layers, embed_dim, num_heads, head_dim, num_kv_heads,
                           global_head_dim = None, num_global_kv_heads = None, pattern = 6,
                           ffn_multiplier = 4, qk_norm = True, post_norm = True,
-                          kv_shared_global = True, **ignored):
+                          kv_shared_global = True, layer_types = None, **ignored):
 
     """Parameter count for a gemma_gpt config, without allocating anything."""
 
@@ -110,7 +150,7 @@ def gemma_parameter_count(vocab_size, num_layers, embed_dim, num_heads, head_dim
 
     total = vocab_size * embed_dim + embed_dim # tied embeddings, final norm
 
-    for kind in gemma_layer_types(num_layers, pattern):
+    for kind in (layer_types if layer_types is not None else gemma_layer_types(num_layers, pattern)):
         is_global = kind == "global"
 
         dim   = global_head_dim     if is_global else head_dim

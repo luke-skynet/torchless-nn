@@ -144,10 +144,17 @@ class GPTEmbedFront(Layer):
         self.input  = input
         self.output = self.table[self.input]
 
+        # while generating, this forward continues a sequence rather than starting one,
+        # so the encodings have to be read from where the tokens actually sit
+        position = self.cache.position if self.cache is not None else 0
+
         if self.scale != 1.0:
             self.output = self.output * self.scale
         if self.positional_encoding is not None:
-            self.output = self.output + self.positional_encoding[:self.input.shape[1],:]
+            self.output = self.output + self.positional_encoding[position : position + self.input.shape[1],:]
+
+        if self.cache is not None:
+            self.cache.position = position + self.input.shape[1]
 
         return self.output
 
@@ -158,6 +165,16 @@ class GPTEmbedFront(Layer):
 
 class GPTEmbedBack(Layer):
 
+    """Unembedding, sharing the table with GPTEmbedFront.
+
+    While a cache is active this returns only the final position's logits. That is the
+    one place incremental decoding changes what a forward means, and it is not an
+    optimization that can be skipped: the logits are the largest tensor in the model,
+    (batch, sequence, 262144) running to 1 GiB per 1024 tokens at Gemma's vocabulary.
+    Unembedding a whole prefill chunk to sample one token from the last row of it is
+    the most expensive mistake available here.
+    """
+
     def __init__(self, table):
         super(GPTEmbedBack, self).__init__()
 
@@ -165,6 +182,8 @@ class GPTEmbedBack(Layer):
         self.table_grads = self.register(self.table)
 
     def forward(self, input):
+        if self.cache is not None:
+            input = input[:, -1:, :]
         self.input = input
         self.output = self.input @ self.table.transpose()
         return self.output

@@ -1,6 +1,5 @@
 import cupy
 import numpy as np
-import cv2
 
 global FLOAT_TYPE 
 FLOAT_TYPE = cupy.float32 # (TF32 enabled)
@@ -49,6 +48,84 @@ class inference_mode:
         return False
 
 
+# key/value cache: state that survives across forwards during incremental decoding
+
+class Cache:
+
+    """Per layer state for incremental decoding.
+
+    Every cached layer needs the same one thing: the absolute position of the next
+    token, so that RoPE and the sinusoidal encodings rotate it to where it actually
+    sits rather than to zero. Attention additionally needs somewhere to keep the keys
+    and values it has already computed, so it calls allocate(); the rest of the layers
+    carry an empty one, which makes `self.cache is not None` a uniform signal that
+    generation is running.
+
+    Layers stay in lockstep with no coordination between them, because every layer
+    sees the same tokens on the same forward.
+
+    The store is contiguous and in absolute order, which is what lets the block mask
+    machinery work unchanged. A sliding window layer keeps `window` entries plus one
+    step of headroom and compacts when it overflows: that copy is `window` entries
+    once per `step` tokens, against the `window` entries every single token already
+    reads, so it amortizes to well under a percent. The alternative, a ring buffer,
+    copies nothing but rotates the key axis, which would make the cached masks depend
+    on position instead of on geometry alone.
+    """
+
+    def __init__(self):
+
+        self.position = 0   # absolute index of the next token
+        self.base     = 0   # absolute index of entry 0 of the store
+        self.fill     = 0   # entries currently held
+        self.capacity = 0
+
+        self.keys   = None
+        self.values = None
+
+    def allocate(self, batch_size, num_kv_heads, head_dim, max_length, window, step):
+
+        """Reserve the store. A sliding layer never reads back more than its window."""
+
+        self.capacity = max_length if window is None else min(max_length, window + step)
+
+        shape = (batch_size, num_kv_heads, 1, self.capacity, head_dim)
+        self.keys   = init_zeros_tensor(shape)
+        self.values = init_zeros_tensor(shape)
+
+    def append(self, key, value):
+
+        """Store this forward's keys and values, and return the whole visible span.
+
+        The span starts at absolute position self.base and is contiguous, so a caller
+        holding absolute key bounds indexes it at [k0 - base : k1 - base].
+        """
+
+        length = key.shape[-2]
+
+        assert length <= self.capacity, (f"{length} new tokens do not fit a cache of "
+                                         f"{self.capacity}: lower the prefill step")
+
+        if self.fill + length > self.capacity:
+            # drop the oldest entries the window has already moved past, keeping the
+            # buffer contiguous. Nothing still reachable is lost: a query can never
+            # look further back than `window`, and the headroom is what guarantees
+            # `window` entries survive every compaction
+            keep = self.capacity - length
+
+            self.keys  [:, :, :, :keep] = self.keys  [:, :, :, self.fill - keep : self.fill]
+            self.values[:, :, :, :keep] = self.values[:, :, :, self.fill - keep : self.fill]
+
+            self.base += self.fill - keep
+            self.fill  = keep
+
+        self.keys  [:, :, :, self.fill : self.fill + length] = key
+        self.values[:, :, :, self.fill : self.fill + length] = value
+        self.fill += length
+
+        return self.keys[:, :, :, :self.fill], self.values[:, :, :, :self.fill]
+
+
 # scattered accumulation, used for embedding table gradients
 
 try:
@@ -64,6 +141,29 @@ def scatter_add(target, indices, values):
     a (batch, sequence, vocab) intermediate, which is fine at char level vocabs and
     fatal at the 262144 token vocab a Gemma style model uses."""
     _scatter_add(target, indices, values)
+
+
+# Checkpoint construction allocates weight storage without random initialization.
+EMPTY_WEIGHTS = False
+
+class empty_weights:
+    def __enter__(self):
+        global EMPTY_WEIGHTS
+        if not INFERENCE_MODE:
+            raise RuntimeError("empty_weights requires inference_mode")
+        self.previous = EMPTY_WEIGHTS
+        EMPTY_WEIGHTS = True
+        return self
+
+    def __exit__(self, *exception):
+        global EMPTY_WEIGHTS
+        EMPTY_WEIGHTS = self.previous
+
+
+def init_weight_tensor(size, scale = 1.0):
+    if EMPTY_WEIGHTS:
+        return cupy.empty(size, dtype = FLOAT_TYPE)
+    return init_random_tensor(size) / scale
 
 
 # tensor initialization with float type
@@ -98,6 +198,11 @@ class Layer:
         self.eval_mode = False
         self.inference_only = INFERENCE_MODE
 
+        # incremental decoding state, None whenever the model is not generating.
+        # Deliberately absent from CACHED: it has to survive clear_cache, the same way
+        # BatchNorm's running statistics do
+        self.cache = None
+
     def register(self, parameter):
 
         """Register a parameter and allocate its optimizer buffers.
@@ -124,6 +229,21 @@ class Layer:
     def clear_cache(self):
         for name in self.CACHED:
             setattr(self, name, None)
+
+    def start_cache(self, batch_size, max_length, step = 1):
+
+        """Begin incremental decoding.
+
+        Every layer gets a Cache, so that `self.cache is not None` is a uniform signal
+        that generation is running; only the layers with something to keep across
+        forwards allocate anything into it. Composite layers recurse, the way
+        clear_cache and set_eval do.
+        """
+
+        self.cache = Cache()
+
+    def stop_cache(self):
+        self.cache = None
 
     def forward(self, *input):
         raise NotImplementedError
@@ -199,6 +319,16 @@ class Residual(Layer):
         super(Residual, self).clear_cache()
         for layer in self.layers:
             layer.clear_cache()
+
+    def start_cache(self, batch_size, max_length, step = 1):
+        super(Residual, self).start_cache(batch_size, max_length, step)
+        for layer in self.layers:
+            layer.start_cache(batch_size, max_length, step)
+
+    def stop_cache(self):
+        super(Residual, self).stop_cache()
+        for layer in self.layers:
+            layer.stop_cache()
             
 
 # crude augments from scratch
@@ -225,6 +355,7 @@ def random_shift(data):
 
 
 def random_rotate(data):
+    import cv2
     
     x_res = data.shape[2]
     y_res = data.shape[3]

@@ -1,6 +1,6 @@
 import cupy
 
-from utils import Layer, FLOAT_TYPE, init_random_tensor, init_zeros_tensor
+from utils import Layer, FLOAT_TYPE, init_random_tensor, init_zeros_tensor, init_weight_tensor
 
 class Convolution(Layer):
 
@@ -204,7 +204,7 @@ class Dense(Layer):
     def __init__(self, input_size, output_size):
         super(Dense, self).__init__()
 
-        self.weights = init_random_tensor((input_size, output_size)) / input_size**0.5
+        self.weights = init_weight_tensor((input_size, output_size), input_size**0.5)
         self.bias    = init_zeros_tensor(output_size)
 
         self.weight_grads = self.register(self.weights)
@@ -259,23 +259,23 @@ class RMSNorm(Layer):
     both (batch, sequence, channels) activations and the (batch, kv_heads, group,
     sequence, head_dim) query/key tensors that QK norm operates on.
 
-    Gemma checkpoints store this weight as (gamma - 1), applying it as (1 + w).
+    Gemma 4 checkpoints store gamma directly; no offset is added when loading.
     """
 
     CACHED = ("input", "output", "normed", "rms")
 
-    def __init__(self, num_channels, eps = 1e-6):
+    def __init__(self, num_channels, eps = 1e-6, with_scale = True):
         super(RMSNorm, self).__init__()
 
         self.channels = num_channels
         self.eps = eps
 
-        self.gamma = init_zeros_tensor(num_channels) + 1
+        self.gamma = init_zeros_tensor(num_channels) + 1 if with_scale else 1.0
 
         self.rms = None
         self.normed = None
 
-        self.gamma_grads = self.register(self.gamma)
+        self.gamma_grads = self.register(self.gamma) if with_scale else None
 
     def forward(self, input):
 
@@ -296,7 +296,8 @@ class RMSNorm(Layer):
         for dim in gradient.shape[1:-1]:
             span *= dim
 
-        self.gamma_grads += cupy.sum(gradient * self.normed, axis = axes) / span
+        if self.gamma_grads is not None:
+            self.gamma_grads += cupy.sum(gradient * self.normed, axis = axes) / span
 
         gradient = gradient * self.gamma
         return (gradient - self.normed * cupy.mean(gradient * self.normed, axis = -1, keepdims = True)) / self.rms
@@ -305,16 +306,15 @@ class RotaryEmbedding:
 
     """Rotary position embeddings, applied to the head split query and key tensors.
 
-    partial_rotary_factor < 1 gives Gemma 4's p-RoPE: only the leading fraction of
-    each head's dimensions is rotated and the remainder carries no position signal,
-    which keeps the low frequency dimensions clean over very long contexts. Gemma 4
-    uses theta 10000 with full rotation on sliding layers, and theta 1e6 with
-    partial_rotary_factor 0.25 on global layers.
+    By default partial_rotary_factor rotates a contiguous prefix. proportional=True
+    selects Gemma 4's convention: frequencies use the full head width, active pairs
+    span the two head halves, and the remaining pairs have zero frequency. Gemma 4
+    uses theta 10000 with full rotation locally, and theta 1e6 with factor 0.25 globally.
 
     This holds no parameters, so it is a plain helper rather than a Layer.
     """
 
-    def __init__(self, head_dim, context_length, theta = 10000.0, partial_rotary_factor = 1.0):
+    def __init__(self, head_dim, context_length, theta = 10000.0, partial_rotary_factor = 1.0, proportional = False):
 
         self.head_dim   = head_dim
         self.rotary_dim = int(head_dim * partial_rotary_factor)
@@ -327,6 +327,12 @@ class RotaryEmbedding:
 
         half     = self.rotary_dim // 2
         inv_freq = 1.0 / (theta ** (cupy.arange(half, dtype = FLOAT_TYPE) * 2.0 / self.rotary_dim))
+
+        if proportional:
+            # Frequencies use the full head width; active pairs straddle its halves.
+            inv_freq = 1.0 / (theta ** (cupy.arange(half, dtype = FLOAT_TYPE) * 2.0 / head_dim))
+            inv_freq = cupy.concatenate((inv_freq, init_zeros_tensor(head_dim // 2 - half)))
+            self.rotary_dim = head_dim
 
         angles = cupy.arange(context_length, dtype = FLOAT_TYPE)[:, None] * inv_freq[None, :]
         angles = cupy.concatenate((angles, angles), axis = -1)
@@ -378,7 +384,8 @@ class MultiHeadAttention(Layer):
 
     kv_shared is Gemma 4's attention_k_eq_v: global layers project once and use the
     result as both key and value. The value branches off before q/k norm and RoPE,
-    since those exist to condition the attention logits and must not touch values.
+    then optionally receives its own unweighted RMSNorm via v_norm=True.
+    attention_scale=None preserves inverse-square-root scaling; Gemma 4 uses 1.0.
     """
 
     CACHED = ("input", "output", "query", "key", "value", "softmax", "chunks", "heads_out")
@@ -386,7 +393,7 @@ class MultiHeadAttention(Layer):
     def __init__(self, embedding_dim, context_length, num_heads, decoder = False,
                        num_kv_heads = None, head_dim = None, qk_norm = False,
                        rope = None, sliding_window = None, kv_shared = False,
-                       chunk_size = None):
+                       chunk_size = None, attention_scale = None, v_norm = False):
         super(MultiHeadAttention, self).__init__()
 
         self.embedding_dim  = embedding_dim
@@ -398,6 +405,7 @@ class MultiHeadAttention(Layer):
 
         assert self.num_heads % self.num_kv_heads == 0, "num_heads must be a multiple of num_kv_heads"
         self.groups = self.num_heads // self.num_kv_heads
+        self.attention_scale = attention_scale
 
         self.query_dim = self.num_heads    * self.heads_dim
         self.kv_dim    = self.num_kv_heads * self.heads_dim
@@ -430,42 +438,48 @@ class MultiHeadAttention(Layer):
 
         self.q_norm = RMSNorm(self.heads_dim) if qk_norm else None
         self.k_norm = RMSNorm(self.heads_dim) if qk_norm else None
+        self.v_norm = RMSNorm(self.heads_dim, with_scale = False) if v_norm else None
 
         if self.fused:
-            self.qkv_weights = init_random_tensor((embedding_dim, 3*embedding_dim)) / embedding_dim**0.5
+            self.qkv_weights = init_weight_tensor((embedding_dim, 3*embedding_dim), embedding_dim**0.5)
             self.qkv_weight_grads = self.register(self.qkv_weights)
         else:
-            self.q_weights = init_random_tensor((embedding_dim, self.query_dim)) / embedding_dim**0.5
-            self.k_weights = init_random_tensor((embedding_dim, self.kv_dim))    / embedding_dim**0.5
+            self.q_weights = init_weight_tensor((embedding_dim, self.query_dim), embedding_dim**0.5)
+            self.k_weights = init_weight_tensor((embedding_dim, self.kv_dim), embedding_dim**0.5)
 
             self.q_weight_grads = self.register(self.q_weights)
             self.k_weight_grads = self.register(self.k_weights)
 
             if not self.kv_shared:
-                self.v_weights = init_random_tensor((embedding_dim, self.kv_dim)) / embedding_dim**0.5
+                self.v_weights = init_weight_tensor((embedding_dim, self.kv_dim), embedding_dim**0.5)
                 self.v_weight_grads = self.register(self.v_weights)
 
-        self.out_weights = init_random_tensor((self.query_dim, embedding_dim)) / self.query_dim**0.5
+        self.out_weights = init_weight_tensor((self.query_dim, embedding_dim), self.query_dim**0.5)
         self.out_weight_grads = self.register(self.out_weights)
 
         # the q/k norms own their own parameters; surface them through this layer so
         # the optimizer sees one flat set of parallel lists
-        for norm in (self.q_norm, self.k_norm):
+        for norm in (self.q_norm, self.k_norm, self.v_norm):
             if norm is not None:
                 self.parameters += norm.parameters
                 self.gradients  += norm.gradients
                 self.moments    += norm.moments
                 self.variances  += norm.variances
 
-    def _key_range(self, q0, q1, length):
+    def _key_range(self, q0, q1, start, end):
 
-        """Keys that queries [q0, q1) are allowed to see."""
+        """Keys that queries [q0, q1) are allowed to see, in absolute positions.
+
+        start is the oldest key still held - 0 without a cache, and the cache's base
+        once a sliding window has evicted past it. Uncached, start = 0 and end = T,
+        which is exactly the plain causal/sliding behaviour.
+        """
 
         if not self.is_decoder:
-            return 0, length
+            return start, end
         if self.sliding_window is None:
-            return 0, q1
-        return max(0, q0 - self.sliding_window + 1), q1
+            return start, q1
+        return max(start, q0 - self.sliding_window + 1), q1
 
     def _block_mask(self, q0, q1, k0, k1):
 
@@ -476,6 +490,12 @@ class MultiHeadAttention(Layer):
         mask is only non-trivial over the diagonal corner - returning that corner keeps
         the cache at O(chunk_size^2) instead of growing with the sequence length. A
         sliding window block is non-trivial throughout, but is bounded by the window.
+
+        A mask of None means every key in the block is visible and there is nothing to
+        add. That is not a rare case: during single token decoding it is *every* block,
+        on sliding and global layers alike. A sliding cache holds precisely the window,
+        so all of it is in range, and a global block reduces to an all visible 1x1
+        corner - so the hot path of generation adds no mask at all.
 
         The signature is the block's geometry, not its position, so interior blocks all
         share one entry and every layer shares the same cache.
@@ -495,15 +515,34 @@ class MultiHeadAttention(Layer):
             if self.sliding_window is not None:
                 allowed = allowed & ((rows - cols) < self.sliding_window)
 
-            _BLOCK_MASKS[signature] = cupy.where(allowed, 0.0, -1e9).astype(FLOAT_TYPE, copy = False)
+            _BLOCK_MASKS[signature] = (None if bool(allowed.all()) else
+                                       cupy.where(allowed, 0.0, -1e9).astype(FLOAT_TYPE, copy = False))
 
         return _BLOCK_MASKS[signature], offset
 
     def clear_cache(self):
         super(MultiHeadAttention, self).clear_cache()
-        for norm in (self.q_norm, self.k_norm):
+        for norm in (self.q_norm, self.k_norm, self.v_norm):
             if norm is not None:
                 norm.clear_cache()
+
+    def start_cache(self, batch_size, max_length, step = 1):
+
+        """Reserve the key/value store this layer needs to decode incrementally.
+
+        A sliding layer's store is bounded by its window rather than by max_length,
+        which is what keeps a long context affordable: at Gemma's 262144 the 31B's
+        sliding layers hold 1.95 GiB between them instead of 440 GiB.
+
+        step is the largest number of tokens a single forward will add. It has to be
+        the prefill chunk size, since the store must hold the window plus everything
+        one forward appends on top of it.
+        """
+
+        super(MultiHeadAttention, self).start_cache(batch_size, max_length, step)
+
+        self.cache.allocate(batch_size, self.num_kv_heads, self.heads_dim,
+                            max_length, self.sliding_window, step)
 
     def _split_heads(self, x, num_heads, groups):
         batch, length = x.shape[0], x.shape[1]
@@ -532,15 +571,31 @@ class MultiHeadAttention(Layer):
         key   = self._split_heads(key,   self.num_kv_heads, 1)
         self.value = self._split_heads(value, self.num_kv_heads, 1)
 
+        if self.v_norm is not None:
+            self.value = self.v_norm.forward(self.value)
+
         if self.q_norm is not None:
             query = self.q_norm.forward(query)
             key   = self.k_norm.forward(key)
 
+        # position of the first new token. Without a cache a forward always starts the
+        # sequence at zero; with one, it continues where the last forward stopped
+        position = self.cache.position if self.cache is not None else 0
+
         if self.rope is not None:
-            query = self.rope.rotate(query)
-            key   = self.rope.rotate(key)
+            query = self.rope.rotate(query, position)
+            key   = self.rope.rotate(key,   position)
+
+        if self.cache is not None:
+            # keys and values go into the store already normed and rotated: both depend
+            # only on the token and its position, so neither ever needs redoing
+            key, self.value = self.cache.append(key, self.value)
+            base = self.cache.base
+        else:
+            base = 0
 
         self.query, self.key = query, key
+        end = position + T
 
         step = self.chunk_size or T
         self.softmax, self.chunks, outputs = [], [], []
@@ -548,34 +603,46 @@ class MultiHeadAttention(Layer):
         for q0 in range(0, T, step):
 
             q1     = min(q0 + step, T)
-            k0, k1 = self._key_range(q0, q1, T)
+            a0, a1 = position + q0, position + q1              # absolute query bounds
+            k0, k1 = self._key_range(a0, a1, base, end)        # absolute key bounds
 
             attends = (self.query[:, :, :, q0:q1, :] @
-                       self.key[:, :, :, k0:k1, :].transpose(0, 1, 2, 4, 3)) / self.heads_dim**.5
+                       self.key[:, :, :, k0-base:k1-base, :].transpose(0, 1, 2, 4, 3))
+            attends = (attends / self.heads_dim**.5 if self.attention_scale is None else
+                       attends * self.attention_scale)
 
             if self.is_decoder:
                 # attends is freshly allocated by the matmul, so this can be in place
-                mask, offset = self._block_mask(q0, q1, k0, k1)
-                attends[..., offset:] += mask
+                mask, offset = self._block_mask(a0, a1, k0, k1)
+                if mask is not None:
+                    attends[..., offset:] += mask
 
             normalization = cupy.max(attends, axis = -1, keepdims = True)
             exponent      = cupy.exp(attends - normalization)
             attends       = exponent / cupy.sum(exponent, axis = -1, keepdims=True)
 
             self.softmax.append(attends)
-            self.chunks.append((q0, q1, k0, k1))
-            outputs.append(attends @ self.value[:, :, :, k0:k1, :])
+            self.chunks.append((a0, a1, k0, k1))
+            outputs.append(attends @ self.value[:, :, :, k0-base:k1-base, :])
 
         self.heads_out = self._merge_heads(outputs[0] if len(outputs) == 1 else
                                            cupy.concatenate(outputs, axis = -2))
 
         self.output = self.heads_out @ self.out_weights
 
+        if self.cache is not None:
+            self.cache.position = end
+
         return self.output
 
     def backward(self, gradient):
 
         B, T, C = gradient.shape
+
+        if self.cache is not None:
+            raise RuntimeError("backward() while a key/value cache is active: the cache holds "
+                               "keys and values computed by earlier forwards, which have no "
+                               "gradient path back to this one. Call stop_cache() first.")
 
         self.out_weight_grads += cupy.tensordot(self.heads_out.transpose(2, 0, 1), gradient, 2) / T
         gradient = gradient @ self.out_weights.transpose()
@@ -597,7 +664,8 @@ class MultiHeadAttention(Layer):
 
             block = block @ self.value[:, :, :, k0:k1, :].transpose(0, 1, 2, 4, 3)
             block = attends * ( block - (block * attends).sum(axis = -1, keepdims=True))
-            block = block / self.heads_dim**.5
+            block = (block / self.heads_dim**.5 if self.attention_scale is None else
+                     block * self.attention_scale)
 
             key_grads[:, :, :, k0:k1, :] += (block.transpose(0, 1, 2, 4, 3) @
                                              self.query[:, :, :, q0:q1, :]).sum(axis = 2, keepdims = True)
@@ -612,6 +680,9 @@ class MultiHeadAttention(Layer):
         if self.q_norm is not None:
             query_grads = self.q_norm.backward(query_grads)
             key_grads   = self.k_norm.backward(key_grads)
+
+        if self.v_norm is not None:
+            value_grads = self.v_norm.backward(value_grads)
 
         query_grads = self._merge_heads(query_grads)
         key_grads   = self._merge_heads(key_grads)
@@ -653,18 +724,10 @@ class GatedFeedForward(Layer):
         self.gate_output = None
         self.hidden_output = None
 
-        self.weights1 = init_random_tensor((num_channels,    hidden_channels)) / num_channels**0.5
-        self.weights2 = init_random_tensor((num_channels,    hidden_channels)) / num_channels**0.5
-        self.weights3 = init_random_tensor((hidden_channels, num_channels))    / hidden_channels**0.5
+        self.weights1 = init_weight_tensor((num_channels,    hidden_channels), num_channels**0.5)
+        self.weights2 = init_weight_tensor((num_channels,    hidden_channels), num_channels**0.5)
+        self.weights3 = init_weight_tensor((hidden_channels, num_channels), hidden_channels**0.5)
 
-        self.weight_grads1   = init_zeros_tensor(self.weights1.shape)
-        self.weight_moments1 = init_zeros_tensor(self.weights1.shape)
-        self.weight_vars1    = init_zeros_tensor(self.weights1.shape)
-
-        self.weight_grads2   = init_zeros_tensor(self.weights2.shape)
-        self.weight_moments2 = init_zeros_tensor(self.weights2.shape)
-        self.weight_vars2    = init_zeros_tensor(self.weights2.shape)
-        
         self.weight_grads1 = self.register(self.weights1)
         self.weight_grads2 = self.register(self.weights2)
         self.weight_grads3 = self.register(self.weights3)
@@ -801,15 +864,18 @@ class TransformerBlock(Layer):
                        dropout_rate = 0.0, norm = LayerNorm, post_norm = False, ffn_multiplier = 4,
                        num_kv_heads = None, head_dim = None, qk_norm = False,
                        rope = None, sliding_window = None, kv_shared = False,
-                       chunk_size = None):
+                       chunk_size = None, attention_scale = None, v_norm = False):
         super(TransformerBlock, self).__init__()
 
+        # Non-trainable checkpoint buffer, applied after both residual branches.
+        self.layer_scalar = init_zeros_tensor(1) + 1
         self.pre_attn_norm  = norm(embed_dim)
         self.attn_block     = MultiHeadAttention(embed_dim, context_length, num_heads, decoder = decoder,
                                                  num_kv_heads = num_kv_heads, head_dim = head_dim,
                                                  qk_norm = qk_norm, rope = rope,
                                                  sliding_window = sliding_window, kv_shared = kv_shared,
-                                                 chunk_size = chunk_size)
+                                                 chunk_size = chunk_size,
+                                                 attention_scale = attention_scale, v_norm = v_norm)
         self.post_attn_norm = norm(embed_dim) if post_norm else None
 
         self.pre_ffn_norm  = norm(embed_dim)
@@ -838,12 +904,13 @@ class TransformerBlock(Layer):
         branch = self.ffn.forward(self.pre_ffn_norm.forward(self.output))
         if self.post_ffn_norm is not None:
             branch = self.post_ffn_norm.forward(branch)
-        self.output = self.output + branch
+        self.output = (self.output + branch) * self.layer_scalar
 
         return self.output
 
     def backward(self, gradient):
 
+        gradient = gradient * self.layer_scalar
         branch = gradient
         if self.post_ffn_norm is not None:
             branch = self.post_ffn_norm.backward(branch)
@@ -860,6 +927,16 @@ class TransformerBlock(Layer):
         super(TransformerBlock, self).clear_cache()
         for block in self.blocks:
             block.clear_cache()
+
+    def start_cache(self, batch_size, max_length, step = 1):
+        super(TransformerBlock, self).start_cache(batch_size, max_length, step)
+        for block in self.blocks:
+            block.start_cache(batch_size, max_length, step)
+
+    def stop_cache(self):
+        super(TransformerBlock, self).stop_cache()
+        for block in self.blocks:
+            block.stop_cache()
 
     def set_eval(self, eval_mode):
         self.ffn.dropout.set_eval(eval_mode)

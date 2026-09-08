@@ -26,7 +26,7 @@ for module in (layers, transformer_adapters, network):
 from layers import (MultiHeadAttention, GatedFeedForward, LayerNorm, RMSNorm, Softcap, Dense,
                     RotaryEmbedding, TransformerBlock, gemma_layer_types)
 from activations import SiLU, GeLU
-from gemma import gemma_gpt, gemma_parameter_count, GEMMA_4_31B
+from gemma import gemma_gpt, gemma_parameter_count, GEMMA_4_31B, GEMMA_4_12B
 from network import CrossEntropy
 
 PASSED, FAILED = [], []
@@ -132,6 +132,30 @@ check_layer("Gemma global block (K=V, p-RoPE)", TransformerBlock(
     head_dim = 8, qk_norm = True, kv_shared = True,
     rope = RotaryEmbedding(8, T, theta = 1e6, partial_rotary_factor = 0.25)), x.copy())
 
+# Gemma 4 checkpoint semantics, including both branches of shared K/V.
+check_layer("unweighted value RMSNorm", RMSNorm(8, with_scale = False),
+            np.random.default_rng(42).normal(size = (2, 3, 8)))
+check_layer("Gemma 4 normalized values and unit attention scale", MultiHeadAttention(
+    C, T, H, decoder = True, num_kv_heads = 1, head_dim = 8,
+    qk_norm = True, v_norm = True, kv_shared = True, attention_scale = 1.0,
+    rope = RotaryEmbedding(8, T, partial_rotary_factor = 0.25, proportional = True)), x.copy())
+scaled_block = TransformerBlock(C, T, H, GeLU, decoder = True)
+scaled_block.layer_scalar[...] = 0.7
+check_layer("checkpoint layer scalar backward", scaled_block, x.copy())
+
+# Independent proportional-RoPE formula: pair i with i + head_dim/2.
+rope = RotaryEmbedding(8, T, theta = 10000.0, partial_rotary_factor = 0.5, proportional = True)
+rope_input = np.random.default_rng(43).normal(size = (B, H, T, 8))
+expected = rope_input.copy()
+for i in range(2):
+    angle = np.arange(T) / 10000.0**(2 * i / 8)
+    expected[..., i] = rope_input[..., i] * np.cos(angle) - rope_input[..., i + 4] * np.sin(angle)
+    expected[..., i + 4] = rope_input[..., i + 4] * np.cos(angle) + rope_input[..., i] * np.sin(angle)
+record("proportional RoPE matches full-head frequency and pairing formula",
+       relerr(rope.rotate(rope_input), expected) < 1e-14)
+record("proportional RoPE backward inverts rotation",
+       relerr(rope.backward(rope.rotate(rope_input)), rope_input) < 1e-14)
+
 print("\nbehaviour:")
 def dense_attention(attn, batch, length):
     """Reassemble the full attention matrix from the per block weights."""
@@ -198,7 +222,8 @@ for window in (3, None): # windowed AND global: global blocks span [0, q1), so e
         long_x = np.random.default_rng(0).standard_normal((1, length, C))
         MultiHeadAttention(C, length, H, decoder = True,
                            sliding_window = window, chunk_size = 4).forward(long_x)
-    cached = sum(m.size for m in _BLOCK_MASKS.values())
+    # a fully visible block caches None rather than an array of zeros, and costs nothing
+    cached = sum(m.size for m in _BLOCK_MASKS.values() if m is not None)
     record(f"block mask cache stays bounded, sliding_window={window}",
            len(_BLOCK_MASKS) <= 6 and cached < 500,
            f"{len(_BLOCK_MASKS)} entries, {cached} elements across sequences up to 128")
@@ -238,6 +263,14 @@ record("60 layer interleave matches Gemma 4 31B's layer_types",
 record("published 31B config reproduces the checkpoint parameter count",
        abs(gemma_parameter_count(**GEMMA_4_31B) - 30.72e9) < 0.1e9,
        f"{gemma_parameter_count(**GEMMA_4_31B)/1e9:.2f}B vs ~30.72B implied by the checkpoint")
+
+types_ = gemma_layer_types(48, GEMMA_4_12B["pattern"])
+record("48 layer interleave matches Gemma 4 12B's layer_types",
+       [i for i, t in enumerate(types_) if t == "global"] == list(range(5, 48, 6)))
+record("published 12B config reproduces the checkpoint parameter count",
+       abs(gemma_parameter_count(**GEMMA_4_12B) - 11.96e9) < 0.1e9,
+       f"{gemma_parameter_count(**GEMMA_4_12B)/1e9:.2f}B vs 11.96B of checkpoint tensors, "
+       f"the remainder being the multimodal projector")
 
 print("\nallocation shape:")
 from layers import AveragePool
@@ -330,6 +363,20 @@ record("inference model allocates no gradients, moments or variances",
 record("parameter lists still line up with the empty buffer lists",
        all(len(l.gradients) == len(l.moments) == len(l.variances) == 0 for l in lean.layers))
 
+# Inspect actual owned arrays, not only the registration lists: the old FFN
+# allocated optimizer arrays that those lists could not see.
+for model_name, model in (("inference", lean), ("training", trained)):
+    for index, block in enumerate(model.layers):
+        if not isinstance(block, TransformerBlock):
+            continue
+        ffn = block.ffn
+        registered = {id(a) for name in ("parameters", "gradients", "moments", "variances")
+                      for a in getattr(ffn, name)}
+        unregistered = [name for name, value in vars(ffn).items()
+                        if isinstance(value, np.ndarray) and id(value) not in registered]
+        record(f"{model_name} FFN {index} owns no unregistered arrays", not unregistered,
+               str(unregistered) if unregistered else "")
+
 for mine, theirs in zip(lean.layers, trained.layers):
     for a, b in zip(mine.parameters, theirs.parameters):
         a[...] = b
@@ -398,6 +445,172 @@ model.train(criterion, data.copy(), labels.copy(), epochs = 120, batch_size = N,
 probs = model._forward(data)
 accuracy = float((probs.argmax(-1) == labels).mean())
 record("model can overfit a memorizable batch", accuracy > 0.95, f"token accuracy {accuracy:.1%}")
+
+print("\nkey/value cache:")
+
+# decoding incrementally must reproduce the single full forward exactly. Everything
+# else about the cache is an optimization; this is the part that has to be true.
+def cache_equivalent(name, build, prefill, length = 17, B = 2, C = 16):
+    attn = build()
+    x = np.random.default_rng(3).standard_normal((B, length, C))
+
+    full = attn.forward(x)
+
+    attn.start_cache(B, length, max(prefill))
+    pieces, at = [], 0
+    for take in prefill:
+        pieces.append(attn.forward(x[:, at : at + take])); at += take
+    while at < length: # the rest one token at a time, as generation actually runs
+        pieces.append(attn.forward(x[:, at : at + 1])); at += 1
+
+    err = relerr(full, np.concatenate(pieces, axis = 1))
+    attn.stop_cache()
+    record(name, err < 1e-13, f"relerr {err:.1e}")
+
+Cw, Tw, Hw = 16, 17, 4
+cache_equivalent("cached decode == full forward, causal",
+                 lambda: MultiHeadAttention(Cw, Tw, Hw, decoder = True), (1,))
+cache_equivalent("cached decode == full forward, causal after a prefill",
+                 lambda: MultiHeadAttention(Cw, Tw, Hw, decoder = True, chunk_size = 4), (9,))
+cache_equivalent("cached decode == full forward, sliding window",
+                 lambda: MultiHeadAttention(Cw, Tw, Hw, decoder = True, sliding_window = 5), (1,))
+cache_equivalent("cached decode == full forward, sliding window after a prefill",
+                 lambda: MultiHeadAttention(Cw, Tw, Hw, decoder = True, sliding_window = 5,
+                                            chunk_size = 9), (9,))
+cache_equivalent("cached decode == full forward, chunked prefill",
+                 lambda: MultiHeadAttention(Cw, Tw, Hw, decoder = True, sliding_window = 5,
+                                            chunk_size = 4), (4, 4, 4))
+cache_equivalent("cached decode == full forward, chunk_size below the prefill step",
+                 lambda: MultiHeadAttention(Cw, Tw, Hw, decoder = True, sliding_window = 5,
+                                            chunk_size = 2), (6, 6))
+cache_equivalent("cached decode == full forward, GQA + qk_norm + rope + kv_shared",
+                 lambda: MultiHeadAttention(Cw, Tw, Hw, decoder = True, num_kv_heads = 2,
+                                            head_dim = 8, kv_shared = True, qk_norm = True,
+                                            sliding_window = 5, rope = RotaryEmbedding(8, Tw),
+                                            chunk_size = 4), (4, 4))
+cache_equivalent("cached decode == full forward, p-rope on a global layer",
+                 lambda: MultiHeadAttention(Cw, Tw, Hw, decoder = True, num_kv_heads = 2,
+                                            head_dim = 8, qk_norm = True, chunk_size = 4,
+                                            rope = RotaryEmbedding(8, Tw, partial_rotary_factor = 0.5)),
+                 (9,))
+
+# a sliding layer's store stays bounded by its window however long the sequence runs,
+# which is the entire reason the cache is affordable at Gemma's context lengths
+walk = MultiHeadAttention(Cw, 512, Hw, decoder = True, sliding_window = 5)
+walk.start_cache(1, 512, 1)
+for _ in range(200):
+    walk.forward(np.random.default_rng(0).standard_normal((1, 1, Cw)))
+record("sliding cache stays bounded by the window", walk.cache.capacity == 6 and walk.cache.fill <= 6,
+       f"{walk.cache.fill}/{walk.cache.capacity} entries after 200 tokens, position {walk.cache.position}")
+
+try:
+    walk.backward(np.ones_like(walk.output))
+    record("backward during cached generation raises", False)
+except RuntimeError:
+    record("backward during cached generation raises", True)
+walk.stop_cache()
+
+# during single token decode every block is fully visible, on sliding and global alike
+_BLOCK_MASKS.clear()
+for window in (5, None):
+    step_attn = MultiHeadAttention(Cw, 64, Hw, decoder = True, sliding_window = window)
+    step_attn.start_cache(1, 64, 1)
+    needed = 0
+    for t in range(40):
+        step_attn.forward(np.random.default_rng(t).standard_normal((1, 1, Cw)))
+        k0, k1 = step_attn._key_range(t, t + 1, step_attn.cache.base, t + 1)
+        needed += step_attn._block_mask(t, t + 1, k0, k1)[0] is not None
+    record(f"single token decode needs no mask (sliding_window={window})", needed == 0,
+           f"{needed}/40 steps")
+    step_attn.stop_cache()
+
+# whole model, at every position rather than only the last. A cached forward returns
+# the distribution for the final token it was given, so feeding a sequence in pieces
+# has to walk the same distributions the single full forward produced. This is what
+# pins down GPTEmbedBack's slice (a prefill chunk longer than one token would come
+# back wrong) and GPTEmbedFront's position offset (sinusoidal encodings read from the
+# wrong row), neither of which the gemma stack alone can catch: gemma_gpt has no
+# absolute encodings, and a prefill that ends on a single token hides the slice
+from network import Network as _Network
+from transformer_adapters import GPTEmbedFront as _Front, GPTEmbedBack as _Back
+from utils import init_random_tensor as _init
+from activations import SoftMax as _SoftMax
+
+def positionwise_cache_equivalent(name, build, prefill, length = 9, B = 2, V = 16):
+    stack = build()
+    ids = rng.integers(0, V, (B, length))
+
+    full = stack.predict(ids)
+
+    stack._start_cache(B, length, max(prefill))
+    seen, at, steps = [], 0, list(prefill)
+    while at < length:
+        take = steps.pop(0) if steps else 1
+        seen.append(stack._forward(ids[:, at : at + take])[:, -1, :])
+        at += take
+    stack._stop_cache()
+
+    # the i-th cached forward ended on absolute position at-1, so it must match the
+    # full forward's distribution there
+    ends, at = [], 0
+    for take in [p for p in prefill] + [1] * length:
+        at += take
+        if at > length: break
+        ends.append(at - 1)
+    err = relerr(np.stack(seen, axis = 1), full[:, ends[:len(seen)], :])
+    record(name, err < 1e-13, f"relerr {err:.1e} over {len(seen)} positions")
+
+def plain_gpt(positional):
+    table = _init((16, 32))
+    return _Network([_Front(table, 16, positional = positional),
+                     TransformerBlock(32, 16, 4, SiLU, decoder = True),
+                     TransformerBlock(32, 16, 4, SiLU, decoder = True),
+                     LayerNorm(32), _Back(table), _SoftMax()])
+
+positionwise_cache_equivalent("cached logits match at every position, sinusoidal GPT",
+                              lambda: plain_gpt("sinusoidal"), (3, 3))
+positionwise_cache_equivalent("cached logits match at every position, no absolute positions",
+                              lambda: plain_gpt("none"), (4,))
+positionwise_cache_equivalent("cached logits match at every position, gemma stack",
+                              lambda: gemma_gpt(**dict(small, context_length = 16)), (3, 3))
+
+# and the whole model, generating
+gen = gemma_gpt(**small)
+prompt = rng.integers(0, vocab, (3, 5))
+
+out = gen.generate(prompt, max_new_tokens = 7, step = 2)
+record("generate returns one row of new tokens per prompt", out.shape == (3, 7), f"shape {out.shape}")
+record("generated tokens are in the vocabulary", bool(((out >= 0) & (out < vocab)).all()))
+record("generate leaves no cache behind", all(l.cache is None for l in gen.layers))
+
+# greedy sampling has to agree with an uncached loop that re-runs the whole prefix.
+# `model` is the overfit one from above rather than a fresh init: an untrained model
+# emits the same token forever, which would pass this even with a broken cache
+greedy = model
+prompt = data[:, :5]
+
+def argmax_sample(self, probabilities, top_k = None):
+    return probabilities[:, -1, :].argmax(-1)[:, None]
+
+saved, network.Network._sample = network.Network._sample, argmax_sample
+cached_out = greedy.generate(prompt, max_new_tokens = 6, step = 2)
+
+slow = prompt
+for _ in range(6):
+    slow = np.concatenate((slow, greedy.predict(slow)[:, -1, :].argmax(-1)[:, None]), axis = 1)
+network.Network._sample = saved
+
+record("the comparison is not vacuous: greedy output actually varies",
+       len(np.unique(cached_out)) > 1, f"{len(np.unique(cached_out))} distinct tokens")
+
+record("cached greedy decode matches an uncached re-run of the whole prefix",
+       bool((cached_out == slow[:, prompt.shape[1]:]).all()),
+       f"{cached_out.tolist()} vs {slow[:, prompt.shape[1]:].tolist()}")
+
+# top_k = 1 leaves exactly one candidate, so the real sampler has to land on it too
+record("top_k = 1 samples greedily",
+       bool((greedy.generate(prompt, max_new_tokens = 6, top_k = 1, step = 2) ==
+             slow[:, prompt.shape[1]:]).all()))
 
 print(f"\n{len(PASSED)} passed, {len(FAILED)} failed")
 for name in FAILED:

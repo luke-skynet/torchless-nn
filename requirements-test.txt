@@ -1,0 +1,9 @@
+# CPU reference tests (no CuPy, CUDA, or checkpoint download required).
+numpy>=2.1,<3
+safetensors==0.8.0
+transformers==5.16.1
+torch==2.14.0
+pytest>=8,<10
+tqdm>=4.67,<5
+
+jinja2>=3.1,<4
