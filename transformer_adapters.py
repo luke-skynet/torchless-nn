@@ -1,7 +1,8 @@
 import cupy
+import cupyx
 
 from utils import Layer, FLOAT_TYPE, init_random_tensor, init_zeros_tensor
-
+from layers import Dropout
 
 class VitProjector(Layer):
 
@@ -27,22 +28,9 @@ class VitProjector(Layer):
         self.cls_reg_tokens        = init_random_tensor((self.cls_reg_size, self.embedding_dim)) / self.embedding_dim**0.5
         self.positional_embeddings = init_zeros_tensor((self.cls_reg_size + self.sequence_length, self.embedding_dim))
 
-        self.projection_grads   = init_zeros_tensor(self.projection.shape)
-        self.projection_moments = init_zeros_tensor(self.projection.shape)
-        self.projection_vars    = init_zeros_tensor(self.projection.shape)
-
-        self.cls_reg_token_grads   = init_zeros_tensor(self.cls_reg_tokens.shape)
-        self.cls_reg_token_moments = init_zeros_tensor(self.cls_reg_tokens.shape)
-        self.cls_reg_token_vars    = init_zeros_tensor(self.cls_reg_tokens.shape)
-        
-        self.positional_embeddings_grads   = init_zeros_tensor(self.positional_embeddings.shape)
-        self.positional_embeddings_moments = init_zeros_tensor(self.positional_embeddings.shape)
-        self.positional_embeddings_vars    = init_zeros_tensor(self.positional_embeddings.shape)
-        
-        self.parameters = [self.projection,         self.cls_reg_tokens,        self.positional_embeddings]
-        self.gradients  = [self.projection_grads,   self.cls_reg_token_grads,   self.positional_embeddings_grads]
-        self.moments    = [self.projection_moments, self.cls_reg_token_moments, self.positional_embeddings_moments]
-        self.variances  = [self.projection_vars,    self.cls_reg_token_vars,    self.positional_embeddings_vars]
+        self.projection_grads              = self.register_param(self.projection)
+        self.cls_reg_token_grads           = self.register_param(self.cls_reg_tokens)
+        self.positional_embeddings_grads   = self.register_param(self.positional_embeddings)
 
     def forward(self, input):
 
@@ -74,7 +62,7 @@ class VitProjector(Layer):
         self.cls_reg_token_grads += gradient[:,:self.cls_reg_size,:].sum(axis = 0)
         gradient = gradient[:,self.cls_reg_size:,:]
 
-        self.projection_grads += cupy.tensordot(self.tokens.transpose(2, 0, 1), gradient, 2) / gradient.shape[1]
+        self.projection_grads += cupy.tensordot(self.tokens.transpose(2, 0, 1), gradient, 2)
         gradient = gradient @ self.projection.transpose()
 
         gradient = gradient.reshape((self.batch_size,
@@ -96,18 +84,8 @@ class VitMLPHead(Layer):
 
         self.class_tokens = None
 
-        self.weight_grads   = init_zeros_tensor(self.weights.shape)
-        self.weight_moments = init_zeros_tensor(self.weights.shape)
-        self.weight_vars    = init_zeros_tensor(self.weights.shape)
-
-        self.bias_grads   = init_zeros_tensor(self.bias.shape)
-        self.bias_moments = init_zeros_tensor(self.bias.shape)
-        self.bias_vars    = init_zeros_tensor(self.bias.shape)
-
-        self.parameters = [self.weights,          self.bias]
-        self.gradients  = [self.weight_grads,     self.bias_grads]
-        self.moments    = [self.weight_moments,   self.bias_moments]
-        self.variances  = [self.weight_vars,      self.bias_vars]
+        self.weight_grads = self.register_param(self.weights)
+        self.bias_grads   = self.register_param(self.bias)
 
     def forward(self, input):
 
@@ -128,63 +106,77 @@ class VitMLPHead(Layer):
         return cupy.concatenate((gradient, init_zeros_tensor(self.input.shape)[:,:-1,:]), axis = 1)
 
 
-class GPTEmbedFront(Layer):
-
-    def __init__(self, table, context_length):
-        super(GPTEmbedFront, self).__init__()
-
-        self.table         = table
+class GPTEmbeddingTable:
+    def __init__(self, vocab_size, embed_size):
+        self.vocab_size = vocab_size
+        self.embed_size = embed_size
+        
+        self.table         = init_random_tensor((vocab_size, embed_size))
         self.table_grads   = init_zeros_tensor(self.table.shape)
         self.table_moments = init_zeros_tensor(self.table.shape)
         self.table_vars    = init_zeros_tensor(self.table.shape)
 
-        self.one_hot        = cupy.eye(table.shape[0], dtype=FLOAT_TYPE)
-        self.one_hot_inputs = None
 
-        pos = cupy.arange(context_length)[:, None]
-        i   = cupy.arange(table.shape[1])[None, :]
+class GPTEmbedFront(Layer):
 
-        self.positional_encoding = pos / 10000**(2 * (i // 2) / table.shape[1])
-        self.positional_encoding[:, 0::2] = cupy.sin(self.positional_encoding[:, 0::2])
-        self.positional_encoding[:, 1::2] = cupy.cos(self.positional_encoding[:, 1::2])
-        self.positional_encoding = self.positional_encoding.astype(FLOAT_TYPE, copy = False)
+    def __init__(self, embedding_table:GPTEmbeddingTable, context_length, positional_embedding = "learned"):    
+        super(GPTEmbedFront, self).__init__()
+        assert positional_embedding == "learned" or positional_embedding == "sinusoidal"
+        
+        self.positional_embedding = positional_embedding
+        self.pos_embedding_table = None
 
-        self.parameters = [self.table]
-        self.gradients  = [self.table_grads]
-        self.moments    = [self.table_moments]
-        self.variances  = [self.table_vars]
+        if self.positional_embedding == "sinusoidal":
+            pos = cupy.arange(context_length)[:, None]
+            i   = cupy.arange(embedding_table.embed_size)[None, :]
+
+            self.pos_embedding_table = pos / 10000**(2 * (i // 2) / embedding_table.embed_size)
+            self.pos_embedding_table[:, 0::2] = cupy.sin(self.pos_embedding_table[:, 0::2])
+            self.pos_embedding_table[:, 1::2] = cupy.cos(self.pos_embedding_table[:, 1::2])
+            self.pos_embedding_table = self.pos_embedding_table.astype(FLOAT_TYPE, copy = False)
+        else:
+            self.pos_embedding_table = init_zeros_tensor((context_length, embedding_table.embed_size))
+            self.pos_embedding_table_grads = self.register_param(self.pos_embedding_table)
+    
+        self.embedding_table = embedding_table
+        self.embeddings = None
+        
+        self.parameters.append(self.embedding_table.table)
+        self.gradients.append(self.embedding_table.table_grads)
+        self.moments.append(self.embedding_table.table_moments)
+        self.variances.append(self.embedding_table.table_vars)
 
     def forward(self, input):
         self.input = input
-        self.one_hot_inputs = self.one_hot[self.input]
-        self.output = self.one_hot_inputs @ self.table + self.positional_encoding[:self.input.shape[1],:]
+        self.embeddings = self.embedding_table.table[input]
+        self.output = self.embeddings + self.pos_embedding_table[:self.input.shape[1],:]
+        
         return self.output
 
     def backward(self, gradient):
-        self.table_grads += cupy.tensordot(self.one_hot_inputs.transpose(2, 0, 1), gradient, 2) / gradient.shape[1]
-        return gradient @ self.table.transpose()
+        
+        B, T, C = gradient.shape
+        
+        cupyx.scatter_add(self.embedding_table.table_grads, self.input, gradient)
+        
+        if self.positional_embedding == "learned":
+            self.pos_embedding_table_grads[:T] += gradient.sum(axis = 0)
+            
+        return None
 
 
 class GPTEmbedBack(Layer):
 
-    def __init__(self, table):
+    def __init__(self, embedding_table:GPTEmbeddingTable):
         super(GPTEmbedBack, self).__init__()
-
-        self.table         = table
-        self.table_grads   = init_zeros_tensor(self.table.shape)
-        self.table_moments = init_zeros_tensor(self.table.shape)
-        self.table_vars    = init_zeros_tensor(self.table.shape)
-
-        self.parameters = [self.table]
-        self.gradients  = [self.table_grads]
-        self.moments    = [self.table_moments]
-        self.variances  = [self.table_vars]
-
+        self.embedding_table = embedding_table
+        # parameter updates handled in GPTEmbedFront
+    
     def forward(self, input):
         self.input = input
-        self.output = self.input @ self.table.transpose()
+        self.output = self.input @ self.embedding_table.table.transpose()
         return self.output
 
     def backward(self, gradient):
-        self.table_grads += cupy.tensordot(self.input.transpose(2, 0, 1), gradient, 2).transpose() / gradient.shape[1]
-        return gradient @ self.table
+        self.embedding_table.table_grads += cupy.tensordot(self.input.transpose(2, 0, 1), gradient, 2).transpose()
+        return gradient @ self.embedding_table.table

@@ -31,6 +31,7 @@ class Layer:
         self.variances = []
 
         self.eval_mode = False
+        self.is_embed_layer_back = False
 
     def forward(self, *input):
         raise NotImplementedError
@@ -40,6 +41,19 @@ class Layer:
 
     def set_eval(self, eval_mode):
         self.eval_mode = eval_mode
+        
+    def register_param(self, parameter):
+        
+        gradient = init_zeros_tensor(parameter.shape)
+        moment = init_zeros_tensor(parameter.shape)
+        variance = init_zeros_tensor(parameter.shape)
+        
+        self.parameters.append(parameter)
+        self.gradients.append(gradient)
+        self.moments.append(moment)
+        self.variances.append(variance)
+        
+        return gradient
 
     def zero_grad(self):
         for grad in self.gradients:
