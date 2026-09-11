@@ -20,6 +20,9 @@ class CrossEntropy:
         labels = self.one_hot[labels]
         eta = 1e-7
         return -1 * cupy.sum(labels * cupy.log(logits + eta))
+    
+    def num_samples(self, labels):
+        return labels.size
 
 
 class Network:
@@ -58,6 +61,8 @@ class Network:
         beta1, beta2 = 0.9, 0.999
 
         for layer in self.layers:
+            if layer.is_embed_layer_back:
+                continue
             
             for param, grad, moment, variance in zip(layer.parameters,
                                                      layer.gradients,
@@ -85,16 +90,16 @@ class Network:
                     augments = None, epochs = 1, batch_size = 64, batches_per_step = 1,
                     learning_rate = 0.001, weight_decay = 0.01):
 
-        step_count = 0
-        samples_per_step = batch_size * batches_per_step
-        
+        step_count = 1
         self._zero_adam()
         
         for i in range(epochs):
             
             self.set_eval(False)
 
+            samples_in_step = 0
             batches_seen = 0
+            
             train_loss, train_correct = 0, 0
 
             shuffle = np.random.permutation(len(train_labels))
@@ -117,11 +122,14 @@ class Network:
                 grad = criterion.gradients(y_hat, y)
                 self._backward(grad)
                 
+                samples_in_step += criterion.num_samples(y)
                 batches_seen += 1
+                
                 if batches_seen % batches_per_step == 0:
-                    step_count += 1
-                    self._update(learning_rate, weight_decay, step_count, samples_per_step)
+                    self._update(learning_rate, weight_decay, step_count, samples_in_step)
                     self._zero_grad()
+                    step_count += 1
+                    samples_in_step = 0
 
                 train_loss += criterion.loss(y_hat, y)
                 train_correct += cupy.equal(cupy.argmax(y_hat, axis = -1), y).astype(cupy.int32).sum()
