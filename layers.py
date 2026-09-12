@@ -345,11 +345,11 @@ class MultiHeadAttention(Layer):
 
 class TransformerFeedForward(Layer):
 
-    def __init__(self, num_channels, activation, dropout_rate = 0.0):
+    def __init__(self, num_channels, activation, res_dropout_rate = 0.0):
         super(TransformerFeedForward, self).__init__()
         
         self.activation:Layer = activation()
-        self.dropout = Dropout(dropout_rate)
+        self.dropout = Dropout(res_dropout_rate)
         
         self.hidden_output = None
 
@@ -450,7 +450,7 @@ class TransformerBlock(Layer):
         self.attn_block = MultiHeadAttention(embed_dim, context_length, num_heads, decoder = decoder)
 
         self.pre_ffn_norm = LayerNorm(embed_dim)
-        self.ffn = TransformerFeedForward(embed_dim, activation, dropout_rate = dropout_rate)
+        self.ffn = TransformerFeedForward(embed_dim, activation, res_dropout_rate = dropout_rate)
 
         self.parameters = [*self.pre_attn_norm.parameters, *self.attn_block.parameters, *self.pre_ffn_norm.parameters, *self.ffn.parameters]
         self.gradients  = [*self.pre_attn_norm.gradients,  *self.attn_block.gradients,  *self.pre_ffn_norm.gradients,  *self.ffn.gradients]

@@ -157,7 +157,7 @@ class GPTEmbedFront(Layer):
         
         B, T, C = gradient.shape
         
-        cupyx.scatter_add(self.embedding_table.table_grads, self.input, gradient)
+        cupy.add.at(self.embedding_table.table_grads, self.input, gradient)
         
         if self.positional_embedding == "learned":
             self.pos_embedding_table_grads[:T] += gradient.sum(axis = 0)
