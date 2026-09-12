@@ -443,14 +443,17 @@ class LayerNorm(Layer):
 
 class TransformerBlock(Layer):
 
-    def __init__(self, embed_dim, context_length, num_heads, activation, decoder = False, dropout_rate = 0.0):
+    def __init__(self, embed_dim, context_length, num_heads, activation, decoder = False, attn_dropout_rate = 0.0, res_dropout_rate = 0.0):
         super(TransformerBlock, self).__init__()
 
         self.pre_attn_norm = LayerNorm(embed_dim)
-        self.attn_block = MultiHeadAttention(embed_dim, context_length, num_heads, decoder = decoder)
+        self.attn_block = MultiHeadAttention(embed_dim, context_length, num_heads, decoder = decoder, 
+                                             attn_dropout_rate = attn_dropout_rate,
+                                             res_dropout_rate = res_dropout_rate)
 
         self.pre_ffn_norm = LayerNorm(embed_dim)
-        self.ffn = TransformerFeedForward(embed_dim, activation, res_dropout_rate = dropout_rate)
+        self.ffn = TransformerFeedForward(embed_dim, activation, 
+                                          res_dropout_rate = res_dropout_rate)
 
         self.parameters = [*self.pre_attn_norm.parameters, *self.attn_block.parameters, *self.pre_ffn_norm.parameters, *self.ffn.parameters]
         self.gradients  = [*self.pre_attn_norm.gradients,  *self.attn_block.gradients,  *self.pre_ffn_norm.gradients,  *self.ffn.gradients]
