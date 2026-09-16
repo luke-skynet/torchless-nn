@@ -60,6 +60,14 @@ patches, tokens, or attention heads. Each optimizer step divides by the actual
 number of labels accumulated: images for classification, tokens for language
 modeling. The final partial accumulation group is applied at the end of each epoch.
 
+On CUDA, `optimizer.py` updates all registered parameters and clears their gradients
+in one kernel launch per optimizer step. It uses the existing arrays, supports
+C-contiguous float32 and float64 tensors (including both in the same model), and
+caches pointer metadata until storage or decay rules change. Each parameter's Adam
+state must match its shape and dtype. Identical shared entries are updated once;
+conflicting optimizer state and overlapping storage are rejected. NumPy uses the
+reference update equations and also clears gradients during the update.
+
 Gemma uses `GPTEmbeddingTable` to share the token weight, accumulated gradient,
 and Adam state between lookup and output projection. The input layer registers
 the state once; both layers retain `.table` access for checkpoint loading.
@@ -112,6 +120,7 @@ Layers built inside the context allocate no gradient, moment or variance buffers
 * **layers.py** - Convolution, BatchNorm, MaxPool, AveragePool, Flatten, Dense, Dropout, and Transformer (LayerNorm, RMSNorm, Attention, Rotary Embeddings, Gated Feed Forward, Logit Softcap) layers.
 * **gemma.py** - Gemma 4 style model assembly: grouped query attention, QK norm, sandwich norms, interleaved sliding window and global attention, and p-RoPE.
 * **network.py** - Network framework class with Cross Entropy loss criterion and AdamW optimization.
+* **optimizer.py** - Fused CUDA AdamW updates and the NumPy reference implementation.
 * **transformer_adapters.py** - ViT image to tokens embedding, ViT MLP classification head, GPT embedding and GPT prediction layers.
 * **test_gemma.py** - Finite difference gradient checks for every layer, runnable on CPU (```python test_gemma.py```).
 * **utils** - Layer interface, Residual Layer wrapper, basic image augmentation functions, and tensor initializers to keep all parameters in FP32/TF32.
@@ -197,6 +206,8 @@ CUPY_TF32=0 TORCHLESS_TEST_DEVICE=cuda python -m pytest tests -q
 ```
 
 The CUDA suite requires a working NVIDIA GPU and a CUDA-enabled PyTorch installation.
+`tests/test_optimizer.py` checks multi-step Adam parity, shared storage, metadata
+replacement, frozen ViT positions, and (on CUDA) a single launch per update.
 CPU parity has been verified; CUDA parity and a full 12B forward pass have not yet
 been run. The source manifest in `tests/fixtures` contains only tensor names, shapes,
 dtypes, configuration, and revision metadata, not checkpoint weights.

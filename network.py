@@ -5,6 +5,7 @@ from tqdm import tqdm
 
 from utils import Layer
 from activations import SoftMax
+from optimizer import Adam
 from layers import *
 from transformer_adapters import *
 
@@ -65,6 +66,7 @@ class Network:
     def __init__(self, layers:list[Layer]):
         self.layers = layers
         self.rng    = xp.random.default_rng() # generation only; training draws nothing here
+        self.optimizer = Adam()
 
         # a fused SoftMax returns its gradient unchanged, which is only right when
         # CrossEntropy produced that gradient for the last layer of the network
@@ -261,37 +263,21 @@ class Network:
 
     def _update(self, learning_rate, weight_decay, t, num_samples, eps = 1e-7):
 
-        beta1, beta2 = 0.9, 0.999
-
+        entries = []
         for layer in self.layers:
-            
+            if layer.inference_only:
+                raise RuntimeError('Cannot update an inference-only layer')
+            if len({len(layer.parameters), len(layer.gradients),
+                    len(layer.moments), len(layer.variances)}) != 1:
+                raise ValueError('Parameter and Adam state lists must have matching lengths')
             for param, grad, moment, variance in zip(layer.parameters,
                                                      layer.gradients,
                                                      layer.moments,
                                                      layer.variances):
-                grad /= num_samples
-                lmda = weight_decay
-                
-                if len(param.shape) == 1 or isinstance(layer, (VitProjector, VitMLPHead, 
-                                                               GPTEmbedFront, GPTEmbedBack)):
-                    lmda = 0.0
-                    
-                moment *= beta1
-                moment += (1 - beta1)*grad
-
-                # grad is scratch from here on: it is zeroed immediately after the
-                # step, so squaring and scaling it in place saves two full sized
-                # temporaries per parameter. Bitwise identical to (1 - beta2)*grad**2.
-                grad *= grad
-                grad *= (1 - beta2)
-
-                variance *= beta2
-                variance += grad
-
-                mom_hat = moment / (1 - beta1**t)
-                var_hat = variance / (1 - beta2**t)
-
-                param -= learning_rate * (mom_hat / (var_hat**0.5 + eps) + lmda * param)
+                decay = param.ndim != 1 and not isinstance(
+                    layer, (VitProjector, VitMLPHead, GPTEmbedFront, GPTEmbedBack))
+                entries.append((param, grad, moment, variance, decay))
+        self.optimizer.step(entries, learning_rate, weight_decay, t, num_samples, eps)
 
     def train(self, criterion, train_data, train_labels, test_data = None, test_labels = None,
                     augments = None, epochs = 1, batch_size = 64, batches_per_step = 1,
@@ -339,7 +325,6 @@ class Network:
                 if batches_seen % batches_per_step == 0:
                     step_count += 1
                     self._update(learning_rate, weight_decay, step_count, samples_in_step, eps=adam_eps)
-                    self._zero_grad()
                     samples_in_step = 0
 
                 train_loss += criterion.loss(y_hat, y)
@@ -350,7 +335,6 @@ class Network:
             if samples_in_step:
                 step_count += 1
                 self._update(learning_rate, weight_decay, step_count, samples_in_step, eps=adam_eps)
-                self._zero_grad()
 
             train_loss     = train_loss    / np.prod(train_labels.shape)
             train_accuracy = train_correct / np.prod(train_labels.shape)

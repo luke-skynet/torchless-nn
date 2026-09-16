@@ -182,7 +182,7 @@ class AveragePool(Layer):
         # This used to multiply by a full input sized array holding one constant, which
         # also promoted the gradient to float64: xp.ones() has no dtype by default.
         gradient = gradient[:, :, :, xp.newaxis, :, xp.newaxis] / (self.pool_h * self.pool_w)
-        gradient = xp.broadcast_to(gradient, self.view_shape).copy()
+        gradient = xp.broadcast_to(gradient, self.view_shape)
         return gradient.reshape(self.batch_size, self.channels, self.in_h, self.in_w)
 
 class Flatten(Layer):
