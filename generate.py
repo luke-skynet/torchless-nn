@@ -1,5 +1,6 @@
-"""Text generation from a local Gemma 4 Unified checkpoint on one CUDA GPU."""
+"""Text generation from a local Gemma 4 Unified checkpoint on CPU or one CUDA GPU."""
 import argparse
+from contextlib import nullcontext
 import json
 import math
 import os
@@ -50,6 +51,8 @@ def parser():
     p.add_argument('--prefill-step', type=int, default=256)
     p.add_argument('--chunk-size', type=int, default=256)
     p.add_argument('--seed', type=int, default=0)
+    p.add_argument('--backend', choices=('numpy', 'cupy'),
+                   default=os.environ.get('TORCHLESS_BACKEND', 'cupy'))
     p.add_argument('--device', type=int, default=0)
     p.add_argument('--tf32', action='store_true', help='Enable TF32; default FP32 is preferable for parity checks')
     p.add_argument('--inspect', action='store_true', help='Validate config and shard headers without CUDA or loading weights')
@@ -78,25 +81,32 @@ def prepare_prompt(args, checkpoint):
     return tokenizer, tokens, stops
 
 
-def configure_cuda(args):
+def configure_backend(args):
     # Set TF32 before importing CuPy. --help and --inspect never need CUDA.
+    if args.backend == 'numpy' and args.tf32:
+        raise ValueError('--tf32 requires --backend cupy')
+    os.environ['TORCHLESS_BACKEND'] = args.backend
     os.environ['CUPY_TF32'] = '1' if args.tf32 else '0'
-    import cupy as cp
-    from cupy.cuda import cublas
+    from backend import xp
+    if xp.__name__ != args.backend:
+        raise ValueError('Backend already imported; select the backend before importing the library')
+    if args.backend == 'numpy':
+        return xp
 
-    device = cp.cuda.Device(args.device)
+    cublas = xp.cuda.cublas
+    device = xp.cuda.Device(args.device)
     device.use()
     math_mode = cublas.CUBLAS_TF32_TENSOR_OP_MATH if args.tf32 else cublas.CUBLAS_DEFAULT_MATH
     cublas.setMathMode(device.cublas_handle, math_mode)
-    return cp
+    return xp
 
 
 class RunMetrics:
     """Allocator high-water marks and synchronized generation event timestamps."""
 
-    def __init__(self, cp):
-        self.cp = cp
-        self.pool = cp.get_default_memory_pool()
+    def __init__(self, xp):
+        self.xp = xp
+        self.pool = xp.get_default_memory_pool() if xp.__name__ == 'cupy' else None
         self.peak_used = 0
         self.peak_reserved = 0
         self.marks = {}
@@ -108,15 +118,16 @@ class RunMetrics:
         return pointer
 
     def event(self, name):
-        self.cp.cuda.get_current_stream().synchronize()
+        if self.pool is not None:
+            self.xp.cuda.get_current_stream().synchronize()
         self.marks[name] = time.perf_counter()
 
     def report(self, prompt_tokens, generated_tokens):
         prefill = self.marks['prefill_end'] - self.marks['prefill_start']
         decode = self.marks['generation_end'] - self.marks['prefill_end']
         return dict(
-            peak_cupy_used_bytes=self.peak_used,
-            peak_cupy_reserved_bytes=self.peak_reserved,
+            peak_xp_used_bytes=self.peak_used if self.pool is not None else None,
+            peak_xp_reserved_bytes=self.peak_reserved if self.pool is not None else None,
             load_seconds=self.marks['load_end'] - self.marks['load_start'],
             prefill_seconds=prefill,
             generation_seconds=decode,
@@ -124,25 +135,30 @@ class RunMetrics:
             generated_tokens=generated_tokens,
             prefill_tokens_per_second=prompt_tokens / prefill,
             generated_tokens_per_second=generated_tokens / decode,
-            memory_note='CuPy allocator high-water marks; excludes CUDA context and external workspaces',
+            memory_note=('CuPy allocator high-water marks; excludes CUDA context and external workspaces'
+                         if self.pool is not None else 'CPU memory usage is not measured'),
         )
 
 
 def run_generation(args, checkpoint, tokens, stops):
-    cp = configure_cuda(args)
-    metrics = RunMetrics(cp)
-    with cp.cuda.using_allocator(metrics.allocate):
+    xp = configure_backend(args)
+    from backend import to_numpy
+
+    metrics = RunMetrics(xp)
+    allocator = xp.cuda.using_allocator(metrics.allocate) if metrics.pool is not None else nullcontext()
+    with allocator:
         print(f'Loading {checkpoint.report["loaded_tensors"]} text tensors in FP32...', file=sys.stderr)
         metrics.event('load_start')
         model, report = checkpoint.load_model(chunk_size=args.chunk_size)
         metrics.event('load_end')
-        model.rng = cp.random.default_rng(args.seed)
+        model.rng = xp.random.default_rng(args.seed)
         generated = model.generate(
             tokens, args.max_new_tokens, temperature=args.temperature,
             top_k=args.top_k, step=args.prefill_step, stop=stops, on_event=metrics.event)
-        ids = cp.asnumpy(generated[0]).tolist()
+        ids = to_numpy(generated[0]).tolist()
 
-    report.update(metrics.report(len(tokens), len(ids)), tf32=args.tf32, device=args.device)
+    report.update(metrics.report(len(tokens), len(ids)), backend=args.backend,
+                  tf32=args.tf32, device=args.device if args.backend == 'cupy' else None)
     return ids, report
 
 

@@ -1,9 +1,9 @@
-import cupy
+from backend import xp, FLOAT_TYPE
 
 import numpy as np
 from tqdm import tqdm
 
-from utils import Layer, FLOAT_TYPE
+from utils import Layer
 from activations import SoftMax
 from layers import *
 from transformer_adapters import *
@@ -22,8 +22,9 @@ class CrossEntropy:
     selects exactly one entry per row, so both operations are a gather instead.
     """
 
-    def __init__(self, num_classes):
+    def __init__(self, num_classes, eps = 1e-7):
         self.num_classes = num_classes
+        self.eps = eps
         self.positions = {}
 
     def _index(self, labels):
@@ -39,7 +40,7 @@ class CrossEntropy:
 
         if shape not in self.positions:
             self.positions[shape] = tuple(
-                cupy.arange(size).reshape((-1,) + (1,) * (len(shape) - axis - 1))
+                xp.arange(size).reshape((-1,) + (1,) * (len(shape) - axis - 1))
                 for axis, size in enumerate(shape))
 
         return self.positions[shape] + (labels,)
@@ -52,15 +53,18 @@ class CrossEntropy:
         return gradient
 
     def loss(self, logits, labels):
-        eta = 1e-7
-        return -1 * cupy.sum(cupy.log(logits[self._index(labels)] + eta))
+        return -1 * xp.sum(xp.log(logits[self._index(labels)] + self.eps))
+
+    def num_samples(self, labels):
+        # One loss per image for classification, or per token for language models.
+        return labels.size
 
 
 class Network:
 
     def __init__(self, layers:list[Layer]):
         self.layers = layers
-        self.rng    = cupy.random.default_rng() # generation only; training draws nothing here
+        self.rng    = xp.random.default_rng() # generation only; training draws nothing here
 
         # a fused SoftMax returns its gradient unchanged, which is only right when
         # CrossEntropy produced that gradient for the last layer of the network
@@ -116,18 +120,18 @@ class Network:
         if top_k is not None and top_k < probabilities.shape[-1]:
             # keep the k largest and renormalize. partition puts the k largest last, so
             # entry -top_k is the threshold every survivor has to meet
-            threshold     = cupy.partition(probabilities, -top_k, axis = -1)[:, -top_k, None]
-            probabilities = cupy.where(probabilities >= threshold, probabilities, 0.0)
-            probabilities = probabilities / cupy.sum(probabilities, axis = -1, keepdims = True)
+            threshold     = xp.partition(probabilities, -top_k, axis = -1)[:, -top_k, None]
+            probabilities = xp.where(probabilities >= threshold, probabilities, 0.0)
+            probabilities = probabilities / xp.sum(probabilities, axis = -1, keepdims = True)
 
         # inverse transform sampling, vectorized over the batch. A vocab sized compare
         # and reduce is free next to the unembedding matmul that just produced these.
         # Scaling the draw by the final cumulative entry rather than trusting it to be
         # exactly 1 keeps float error from ever running off the end of the row
-        cumulative = cupy.cumsum(probabilities, axis = -1)
+        cumulative = xp.cumsum(probabilities, axis = -1)
         draw = self.rng.random((probabilities.shape[0], 1), dtype = FLOAT_TYPE)
 
-        return cupy.sum(cumulative < draw * cumulative[:, -1, None], axis = -1, keepdims = True)
+        return xp.sum(cumulative < draw * cumulative[:, -1, None], axis = -1, keepdims = True)
 
     def generate(self, tokens, max_new_tokens, temperature = 1.0, top_k = None,
                        step = 256, stop = None, on_event = None):
@@ -167,9 +171,9 @@ class Network:
             raise ValueError("temperature must be finite and nonnegative (0 means greedy)")
         if top_k is not None and (not isinstance(top_k, int) or isinstance(top_k, bool) or top_k < 1):
             raise ValueError("top_k must be a positive integer or None")
-        tokens = cupy.asarray(tokens)
+        tokens = xp.asarray(tokens)
         if tokens.ndim == 1:
-            tokens = tokens[cupy.newaxis, :]
+            tokens = tokens[xp.newaxis, :]
         if tokens.ndim != 2 or tokens.shape[0] == 0 or tokens.shape[1] == 0:
             raise ValueError("tokens must be a nonempty (batch, prompt) integer array")
         if tokens.dtype.kind not in 'iu':
@@ -177,7 +181,7 @@ class Network:
         batch_size, prompt_length = tokens.shape
         if isinstance(self.layers[0], GPTEmbedFront):
             vocab = self.layers[0].table.shape[0]
-            if bool(cupy.any(tokens < 0)) or bool(cupy.any(tokens >= vocab)):
+            if bool(xp.any(tokens < 0)) or bool(xp.any(tokens >= vocab)):
                 raise ValueError("token ID outside the vocabulary")
         limit = getattr(self, 'context_length', None)
         if limit is not None and prompt_length + max_new_tokens > limit:
@@ -210,7 +214,7 @@ class Network:
         previous_temperature = softmax.temperature
         softmax.temperature = temperature if temperature > 0 else 1.0
         generated = []
-        finished = cupy.zeros((batch_size, 1), dtype=bool)
+        finished = xp.zeros((batch_size, 1), dtype=bool)
         try:
             # Cache allocation must also be covered by cleanup on failure.
             self._start_cache(batch_size, prompt_length + max_new_tokens, step)
@@ -221,17 +225,17 @@ class Network:
             if on_event is not None:
                 on_event('prefill_end')
             for i in range(max_new_tokens):
-                sampled = (cupy.argmax(probabilities[:, -1, :], axis=-1)[:, None]
+                sampled = (xp.argmax(probabilities[:, -1, :], axis=-1)[:, None]
                            if temperature == 0 else self._sample(probabilities, top_k))
                 if stop_ids:
                     # Finished rows remain stopped while other rows continue.
-                    sampled = cupy.where(finished, stop_ids[0], sampled)
-                    finished |= cupy.isin(sampled, cupy.asarray(stop_ids))
+                    sampled = xp.where(finished, stop_ids[0], sampled)
+                    finished |= xp.isin(sampled, xp.asarray(stop_ids))
                 generated.append(sampled)
-                if (stop_ids and bool(cupy.all(finished))) or i + 1 == max_new_tokens:
+                if (stop_ids and bool(xp.all(finished))) or i + 1 == max_new_tokens:
                     break
                 probabilities = self._forward(sampled)
-            result = cupy.concatenate(generated, axis=1)
+            result = xp.concatenate(generated, axis=1)
             if on_event is not None:
                 on_event('generation_end')
             return result
@@ -255,7 +259,7 @@ class Network:
         for layer in self.layers:
             layer.zero_adam()
 
-    def _update(self, learning_rate, weight_decay, t, num_samples):
+    def _update(self, learning_rate, weight_decay, t, num_samples, eps = 1e-7):
 
         beta1, beta2 = 0.9, 0.999
 
@@ -287,11 +291,11 @@ class Network:
                 mom_hat = moment / (1 - beta1**t)
                 var_hat = variance / (1 - beta2**t)
 
-                param -= learning_rate * (mom_hat / (var_hat**0.5 + 1e-7) + lmda * param)
+                param -= learning_rate * (mom_hat / (var_hat**0.5 + eps) + lmda * param)
 
     def train(self, criterion, train_data, train_labels, test_data = None, test_labels = None,
                     augments = None, epochs = 1, batch_size = 64, batches_per_step = 1,
-                    learning_rate = 0.001, weight_decay = 0.01):
+                    learning_rate = 0.001, weight_decay = 0.01, adam_eps = 1e-7):
 
         if any(layer.inference_only for layer in self.layers):
             raise RuntimeError("this model was built inside inference_mode(): it has no gradient, "
@@ -299,7 +303,6 @@ class Network:
                                "context to train.")
 
         step_count = 0
-        samples_per_step = batch_size * batches_per_step
         
         self._zero_adam()
         
@@ -308,6 +311,7 @@ class Network:
             self.set_eval(False)
 
             batches_seen = 0
+            samples_in_step = 0
             train_loss, train_correct = 0, 0
 
             shuffle = np.random.permutation(len(train_labels))
@@ -322,23 +326,32 @@ class Network:
                 if augments is not None:
                     x = augments(x)
 
-                x = cupy.array(x)
-                y = cupy.array(y)
+                x = xp.array(x)
+                y = xp.array(y)
                 
                 y_hat = self._forward(x)
                 
                 grad = criterion.gradients(y_hat, y)
                 self._backward(grad)
                 
+                samples_in_step += criterion.num_samples(y)
                 batches_seen += 1
                 if batches_seen % batches_per_step == 0:
                     step_count += 1
-                    self._update(learning_rate, weight_decay, step_count, samples_per_step)
+                    self._update(learning_rate, weight_decay, step_count, samples_in_step, eps=adam_eps)
                     self._zero_grad()
+                    samples_in_step = 0
 
                 train_loss += criterion.loss(y_hat, y)
-                train_correct += cupy.equal(cupy.argmax(y_hat, axis = -1), y).astype(cupy.int32).sum()
+                train_correct += xp.equal(xp.argmax(y_hat, axis = -1), y).astype(xp.int32).sum()
                 
+            # Apply the final incomplete accumulation group before evaluation or
+            # the next epoch's set_eval() clears its gradients.
+            if samples_in_step:
+                step_count += 1
+                self._update(learning_rate, weight_decay, step_count, samples_in_step, eps=adam_eps)
+                self._zero_grad()
+
             train_loss     = train_loss    / np.prod(train_labels.shape)
             train_accuracy = train_correct / np.prod(train_labels.shape)
             print("epoch:", i + 1, "train loss:", train_loss, "train accuracy:", train_accuracy)
@@ -354,12 +367,12 @@ class Network:
 
         for i in tqdm(range(0, len(test_data), batch_size)):
 
-            x = cupy.array(test_data  [i: min(i + batch_size, len(test_data))])
-            y = cupy.array(test_labels[i: min(i + batch_size, len(test_data))])
+            x = xp.array(test_data  [i: min(i + batch_size, len(test_data))])
+            y = xp.array(test_labels[i: min(i + batch_size, len(test_data))])
 
             y_hat = self.predict(x)
 
             loss += criterion.loss(y_hat, y)
-            correct += cupy.equal(cupy.argmax(y_hat, axis = -1), y).astype(cupy.int32).sum()
+            correct += xp.equal(xp.argmax(y_hat, axis = -1), y).astype(xp.int32).sum()
 
         return loss / np.prod(test_labels.shape), correct / np.prod(test_labels.shape)

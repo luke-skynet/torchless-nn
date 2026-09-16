@@ -8,10 +8,33 @@ import torch
 from safetensors.torch import save_file
 from transformers import Gemma4UnifiedTextConfig, Gemma4UnifiedForCausalLM
 
-import cupy as xp
+from backend import xp
 from checkpoint import Checkpoint, load_checkpoint, model_config
 from gemma import gemma_gpt
 from utils import inference_mode, empty_weights
+
+
+@pytest.mark.parametrize('declared', [False, True])
+def test_checkpoint_epsilon_fallback(reference, tmp_path, declared):
+    from layers import RMSNorm, TransformerBlock
+    save_reference(reference, tmp_path)
+    path = tmp_path / 'config.json'
+    config = json.loads(path.read_text())
+    text = config.get('text_config', config)
+    expected = text['rms_norm_eps'] if declared else .02
+    if not declared:
+        del text['rms_norm_eps']
+    path.write_text(json.dumps(config))
+    model, _ = load_checkpoint(tmp_path, default_rms_norm_eps=.02)
+    norms = []
+    for layer in model.layers:
+        if isinstance(layer, RMSNorm):
+            norms.append(layer)
+        elif isinstance(layer, TransformerBlock):
+            norms.extend(child for child in layer.blocks if isinstance(child, RMSNorm))
+            norms.extend(child for child in (layer.attn_block.q_norm, layer.attn_block.k_norm,
+                                             layer.attn_block.v_norm) if child is not None)
+    assert norms and all(norm.eps == expected for norm in norms)
 
 
 def host(array):
@@ -147,7 +170,7 @@ def test_loader_matches_all_transposes_and_scalars(reference, tmp_path):
         ours = gemma_gpt(**checkpoint.config)
     checkpoint.load_into(ours, chunk_bytes=64)
     # Check independently named destinations, with deliberately tiny transfer chunks.
-    np.testing.assert_array_equal(host(ours.layers[1].ffn.weights1),
+    np.testing.assert_array_equal(host(ours.layers[1].ffn.act_weights),
                                   reference.model.layers[0].mlp.gate_proj.weight.detach().numpy().T)
     np.testing.assert_array_equal(host(ours.layers[3].attn_block.q_weights),
                                   reference.model.layers[2].self_attn.q_proj.weight.detach().numpy().T)

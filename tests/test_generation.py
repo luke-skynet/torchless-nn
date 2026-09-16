@@ -1,4 +1,8 @@
 import json
+import os
+from pathlib import Path
+import subprocess
+import sys
 import numpy as np
 import pytest
 import torch
@@ -7,7 +11,7 @@ from tokenizers.models import WordLevel
 from tokenizers.pre_tokenizers import Whitespace
 from transformers import PreTrainedTokenizerFast, AutoTokenizer
 
-import cupy as xp
+from backend import xp
 from checkpoint import load_checkpoint
 from generate import encode_prompt, stop_tokens, main
 from test_checkpoint import reference, save_reference, host
@@ -125,3 +129,26 @@ def test_inspect_cli_needs_no_cuda(reference, tmp_path, capsys):
     report = json.loads(capsys.readouterr().out)
     assert report['loaded_tensors'] > 0
     assert report['shards'] == 2
+
+
+def test_numpy_generation_cli(reference, tokenizer, tmp_path):
+    save_reference(reference, tmp_path)
+    report_path = tmp_path / 'report.json'
+    result = subprocess.run(
+        [sys.executable, 'generate.py', '--checkpoint', str(tmp_path), '--backend', 'numpy',
+         '--prompt', 'hello world', '--context-length', '32', '--max-new-tokens', '3',
+         '--prefill-step', '3', '--chunk-size', '2', '--report', str(report_path)],
+        cwd=Path(__file__).resolve().parents[1],
+        env={**os.environ, 'TORCHLESS_BACKEND': 'cupy'},
+        capture_output=True, text=True, check=True)
+    ids = encode_prompt(tokenizer, 'hello world')
+    with torch.no_grad():
+        expected = reference.generate(torch.tensor([ids]), max_new_tokens=3, do_sample=False,
+                                      eos_token_id=[1, 3], pad_token_id=0)
+    assert result.stdout.strip() == tokenizer.decode(expected[0, len(ids):].tolist(),
+                                                    skip_special_tokens=True).strip()
+    report = json.loads(report_path.read_text())
+    assert report['backend'] == 'numpy' and report['device'] is None
+    assert report['peak_xp_used_bytes'] is None and report['peak_xp_reserved_bytes'] is None
+    assert report['generated_tokens'] == expected.shape[1] - len(ids)
+    assert report['prefill_seconds'] > 0 and report['generation_seconds'] > 0

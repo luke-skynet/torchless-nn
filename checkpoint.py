@@ -127,7 +127,7 @@ def _rope_config(text, global_head_dim):
     return local, global_rope
 
 
-def model_config(config, context_length=None):
+def model_config(config, context_length=None, default_rms_norm_eps=1e-6):
     """Translate a supported dense Gemma 4 checkpoint into assembler arguments."""
     text = _validate_text_config(config)
     kinds = _layer_types(text)
@@ -140,7 +140,7 @@ def model_config(config, context_length=None):
     if not isinstance(context_length, int) or not 1 <= context_length <= limit:
         raise ValueError(f'context_length must be in [1, {limit}]')
 
-    epsilon = text.get('rms_norm_eps', 1e-6)
+    epsilon = text.get('rms_norm_eps', default_rms_norm_eps)
     cap = text.get('final_logit_softcapping')
     if not math.isfinite(epsilon) or epsilon <= 0 or (cap is not None and (not math.isfinite(cap) or cap <= 0)):
         raise ValueError('Invalid RMS epsilon or logit softcap')
@@ -191,9 +191,9 @@ def tensor_specs(config):
         for name in ('q_norm', 'k_norm'):
             add(f'self_attn.{name}.weight', (head_dim,), ('attn_block', name, 'gamma'))
         hidden = embed_dim * config['ffn_multiplier']
-        for name, shape, attr in [('gate_proj', (hidden, embed_dim), 'weights1'),
-                                  ('up_proj', (hidden, embed_dim), 'weights2'),
-                                  ('down_proj', (embed_dim, hidden), 'weights3')]:
+        for name, shape, attr in [('gate_proj', (hidden, embed_dim), 'act_weights'),
+                                  ('up_proj', (hidden, embed_dim), 'gate_weights'),
+                                  ('down_proj', (embed_dim, hidden), 'out_weights')]:
             add(f'mlp.{name}.weight', shape, ('ffn', attr), True)
         for name, attr in [('input_layernorm', 'pre_attn_norm'),
                            ('post_attention_layernorm', 'post_attn_norm'),
@@ -213,10 +213,11 @@ def target_array(model, path):
 class Checkpoint:
     """Validate all shard headers before model allocation; mmap one tensor at a time."""
 
-    def __init__(self, directory, context_length=None):
+    def __init__(self, directory, context_length=None, default_rms_norm_eps=1e-6):
         self.directory = Path(directory).expanduser().resolve()
         self.raw_config = json.loads((self.directory / 'config.json').read_text())
-        self.config = model_config(self.raw_config, context_length)
+        self.config = model_config(self.raw_config, context_length,
+                                   default_rms_norm_eps=default_rms_norm_eps)
         self.specs = tensor_specs(self.config)
         self.tensors = self._read_shards()
         self._validate_manifest()
@@ -342,6 +343,11 @@ class Checkpoint:
         return model, report
 
 
-def load_checkpoint(directory, context_length=None, chunk_size=256):
-    """Return an inference-only FP32 CuPy model and its tensor accounting report."""
-    return Checkpoint(directory, context_length).load_model(chunk_size=chunk_size)
+def load_checkpoint(directory, context_length=None, chunk_size=256, default_rms_norm_eps=1e-6):
+    """Return an inference-only FP32 model and its tensor accounting report.
+
+    default_rms_norm_eps is used only when the checkpoint omits rms_norm_eps.
+    An explicit checkpoint value always takes precedence.
+    """
+    return Checkpoint(directory, context_length,
+                      default_rms_norm_eps=default_rms_norm_eps).load_model(chunk_size=chunk_size)

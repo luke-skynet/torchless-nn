@@ -1,8 +1,5 @@
-import cupy
+from backend import xp, FLOAT_TYPE
 import numpy as np
-
-global FLOAT_TYPE 
-FLOAT_TYPE = cupy.float32 # (TF32 enabled)
 
 
 # inference mode: build a model with no training state at all
@@ -126,23 +123,6 @@ class Cache:
         return self.keys[:, :, :, :self.fill], self.values[:, :, :, :self.fill]
 
 
-# scattered accumulation, used for embedding table gradients
-
-try:
-    from cupyx import scatter_add as _scatter_add
-except ImportError: # running on CPU with numpy substituted for cupy
-    def _scatter_add(target, indices, values):
-        cupy.add.at(target, indices, values)
-
-def scatter_add(target, indices, values):
-    """In place target[indices] += values, summing contributions of repeated indices.
-
-    Used instead of a one hot matmul for embedding lookups: the one hot route costs
-    a (batch, sequence, vocab) intermediate, which is fine at char level vocabs and
-    fatal at the 262144 token vocab a Gemma style model uses."""
-    _scatter_add(target, indices, values)
-
-
 # Checkpoint construction allocates weight storage without random initialization.
 EMPTY_WEIGHTS = False
 
@@ -162,18 +142,18 @@ class empty_weights:
 
 def init_weight_tensor(size, scale = 1.0):
     if EMPTY_WEIGHTS:
-        return cupy.empty(size, dtype = FLOAT_TYPE)
+        return xp.empty(size, dtype = FLOAT_TYPE)
     return init_random_tensor(size) / scale
 
 
 # tensor initialization with float type
 
 def init_random_tensor(size):
-    rng = cupy.random.default_rng()
+    rng = xp.random.default_rng()
     return rng.standard_normal(size, dtype = FLOAT_TYPE)
 
 def init_zeros_tensor(size):
-    return cupy.zeros(size, dtype = FLOAT_TYPE)
+    return xp.zeros(size, dtype = FLOAT_TYPE)
 
 
 # layer interface and residual layer wrapper
@@ -296,12 +276,12 @@ class Residual(Layer):
         if self.mode == "add":
             self.output = self.input + x
         elif self.mode == "concat":
-            self.output = cupy.concatenate((self.input, x), axis = self.concat_axis)
+            self.output = xp.concatenate((self.input, x), axis = self.concat_axis)
         return self.output
     
     def backward(self, gradient):
         
-        gradient, nabla = (gradient, gradient) if self.mode == "add" else cupy.array_split(gradient, 
+        gradient, nabla = (gradient, gradient) if self.mode == "add" else xp.array_split(gradient,
                                                                                            (self.input.shape[self.concat_axis], ),
                                                                                            axis = self.concat_axis)
         

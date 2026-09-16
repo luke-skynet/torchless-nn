@@ -1,6 +1,6 @@
-import cupy
+from backend import xp, FLOAT_TYPE
 
-from utils import Layer, FLOAT_TYPE, init_random_tensor, init_zeros_tensor, init_weight_tensor
+from utils import Layer, init_random_tensor, init_zeros_tensor, init_weight_tensor
 
 class Convolution(Layer):
 
@@ -27,29 +27,29 @@ class Convolution(Layer):
 
         self.input = input
         
-        self.padded_input = cupy.pad(self.input, ((0, 0), (0, 0), (self.pad_h, self.pad_h), (self.pad_w, self.pad_w)))
+        self.padded_input = xp.pad(self.input, ((0, 0), (0, 0), (self.pad_h, self.pad_h), (self.pad_w, self.pad_w)))
 
-        self.output = cupy.lib.stride_tricks.sliding_window_view(self.padded_input, self.kernel_size, (2, 3))
-        self.output = cupy.einsum("nchwkl,ockl->nohw", self.output, self.weights)
+        self.output = xp.lib.stride_tricks.sliding_window_view(self.padded_input, self.kernel_size, (2, 3))
+        self.output = xp.einsum("nchwkl,ockl->nohw", self.output, self.weights)
         self.output = self.output + self.bias
 
         return self.output
 
     def backward(self, gradient):
 
-        conv_in = cupy.lib.stride_tricks.sliding_window_view(self.padded_input, self.output_dims, (2, 3))
-        self.weight_grads += cupy.einsum("ncklhw,nohw->ockl", conv_in, gradient)
+        conv_in = xp.lib.stride_tricks.sliding_window_view(self.padded_input, self.output_dims, (2, 3))
+        self.weight_grads += xp.einsum("ncklhw,nohw->ockl", conv_in, gradient)
 
-        self.bias_grads += cupy.sum(gradient, axis = (0, 2, 3), keepdims = True)
+        self.bias_grads += xp.sum(gradient, axis = (0, 2, 3), keepdims = True)
 
         grad_pad_h = self.kernel_size[0] - 1
         grad_pad_w = self.kernel_size[1] - 1
 
-        flipped_weights = cupy.flip(self.weights, axis=(2, 3))
+        flipped_weights = xp.flip(self.weights, axis=(2, 3))
 
-        gradient = cupy.pad(gradient, ((0, 0), (0, 0), (grad_pad_h, grad_pad_h), (grad_pad_w, grad_pad_w)))
-        gradient = cupy.lib.stride_tricks.sliding_window_view(gradient, self.kernel_size, (2, 3))
-        gradient = cupy.einsum("nohwkl,ockl->nchw", gradient, flipped_weights)
+        gradient = xp.pad(gradient, ((0, 0), (0, 0), (grad_pad_h, grad_pad_h), (grad_pad_w, grad_pad_w)))
+        gradient = xp.lib.stride_tricks.sliding_window_view(gradient, self.kernel_size, (2, 3))
+        gradient = xp.einsum("nohwkl,ockl->nchw", gradient, flipped_weights)
         gradient = gradient[:, :, self.pad_h:gradient.shape[2]-self.pad_h, self.pad_w:gradient.shape[3]-self.pad_w]
         
         return gradient
@@ -57,11 +57,11 @@ class Convolution(Layer):
 class BatchNorm(Layer):
     CACHED = ("input", "output", "mean", "var", "std", "centered", "normed")
 
-    def __init__(self, num_channels):
+    def __init__(self, num_channels, eps = 1e-5):
         super(BatchNorm, self).__init__()
         
         self.channels = num_channels
-        self.eps = 1e-5
+        self.eps = eps
         
         self.momentum = 0.1
         
@@ -85,8 +85,8 @@ class BatchNorm(Layer):
         self.input = input
         
         if self.eval_mode is False:
-            self.mean = cupy.mean(input, axis = (0, 2, 3), keepdims = True)
-            self.var  = cupy.var(input, axis = (0, 2, 3), keepdims = True)
+            self.mean = xp.mean(input, axis = (0, 2, 3), keepdims = True)
+            self.var  = xp.var(input, axis = (0, 2, 3), keepdims = True)
             self.running_mean = (1 - self.momentum) * self.running_mean + self.momentum * self.mean
             self.running_var  = (1 - self.momentum) * self.running_var  + self.momentum * self.var
         else:
@@ -103,14 +103,14 @@ class BatchNorm(Layer):
             
     def backward(self, gradient):
         
-        self.gamma_grads += cupy.sum(gradient * self.normed, axis = (0, 2, 3), keepdims = True)
-        self.beta_grads  += cupy.sum(gradient,               axis = (0, 2, 3), keepdims = True)
+        self.gamma_grads += xp.sum(gradient * self.normed, axis = (0, 2, 3), keepdims = True)
+        self.beta_grads  += xp.sum(gradient,               axis = (0, 2, 3), keepdims = True)
         
         gradient = gradient * self.gamma
         
-        gradient_normed = (gradient - cupy.mean(gradient, axis = (0, 2, 3), keepdims = True)) / self.std
+        gradient_normed = (gradient - xp.mean(gradient, axis = (0, 2, 3), keepdims = True)) / self.std
         
-        return gradient_normed - self.centered * (cupy.mean(gradient * self.centered, axis = (0, 2, 3), keepdims = True) / self.std**3)
+        return gradient_normed - self.centered * (xp.mean(gradient * self.centered, axis = (0, 2, 3), keepdims = True) / self.std**3)
     
 
 class MaxPool(Layer):
@@ -143,7 +143,7 @@ class MaxPool(Layer):
         return self.output
 
     def backward(self, gradient):
-        gradient = gradient[:, :, :, cupy.newaxis, :, cupy.newaxis]
+        gradient = gradient[:, :, :, xp.newaxis, :, xp.newaxis]
         gradient = gradient * self.mask
         gradient = gradient.reshape(self.batch_size, self.channels, self.in_h, self.in_w)
         return gradient
@@ -180,9 +180,9 @@ class AveragePool(Layer):
     def backward(self, gradient):
         # every input in a window contributed equally, so the gradient spreads evenly.
         # This used to multiply by a full input sized array holding one constant, which
-        # also promoted the gradient to float64: cupy.ones() has no dtype by default.
-        gradient = gradient[:, :, :, cupy.newaxis, :, cupy.newaxis] / (self.pool_h * self.pool_w)
-        gradient = cupy.broadcast_to(gradient, self.view_shape).copy()
+        # also promoted the gradient to float64: xp.ones() has no dtype by default.
+        gradient = gradient[:, :, :, xp.newaxis, :, xp.newaxis] / (self.pool_h * self.pool_w)
+        gradient = xp.broadcast_to(gradient, self.view_shape).copy()
         return gradient.reshape(self.batch_size, self.channels, self.in_h, self.in_w)
 
 class Flatten(Layer):
@@ -217,7 +217,7 @@ class Dense(Layer):
 
     def backward(self, gradient):
         self.weight_grads += self.input.transpose() @ gradient
-        self.bias_grads   += cupy.sum(gradient, axis = 0)
+        self.bias_grads   += xp.sum(gradient, axis = 0)
         return gradient @ self.weights.transpose()
 
 class Dropout(Layer):
@@ -227,7 +227,7 @@ class Dropout(Layer):
         super(Dropout, self).__init__()
         
         self.dropout_rate = dropout_rate
-        self.dropout_rng  = cupy.random.default_rng()
+        self.dropout_rng  = xp.random.default_rng()
         self.dropout_neurons = None
     
     def forward(self, input):
@@ -237,12 +237,13 @@ class Dropout(Layer):
             self.dropout_neurons = self.dropout_neurons / FLOAT_TYPE(1 - self.dropout_rate)
             self.output = self.input * self.dropout_neurons
         else:
+            self.dropout_neurons = None
             self.output = self.input
         return self.output
         
     def backward(self, gradient):
         if self.dropout_rate > 0.0 and self.eval_mode is False:
-            gradient *= self.dropout_neurons
+            gradient = gradient * self.dropout_neurons
         return gradient
 
 # Causal masks are cached by block geometry, not by sequence length, and shared across
@@ -281,7 +282,7 @@ class RMSNorm(Layer):
 
         self.input = input
 
-        self.rms    = (cupy.mean(input * input, axis = -1, keepdims = True) + self.eps)**0.5
+        self.rms    = (xp.mean(input * input, axis = -1, keepdims = True) + self.eps)**0.5
         self.normed = input / self.rms
 
         self.output = self.gamma * self.normed
@@ -289,18 +290,15 @@ class RMSNorm(Layer):
 
     def backward(self, gradient):
 
-        # match the library convention of summing weight grads over the batch and
-        # averaging over every axis between batch and channels
+        # Sum contributions wherever gamma is shared. The optimizer normalizes
+        # once by the number of loss labels in the accumulated step.
         axes = tuple(range(gradient.ndim - 1))
-        span = 1
-        for dim in gradient.shape[1:-1]:
-            span *= dim
 
         if self.gamma_grads is not None:
-            self.gamma_grads += cupy.sum(gradient * self.normed, axis = axes) / span
+            self.gamma_grads += xp.sum(gradient * self.normed, axis = axes)
 
         gradient = gradient * self.gamma
-        return (gradient - self.normed * cupy.mean(gradient * self.normed, axis = -1, keepdims = True)) / self.rms
+        return (gradient - self.normed * xp.mean(gradient * self.normed, axis = -1, keepdims = True)) / self.rms
 
 class RotaryEmbedding:
 
@@ -326,24 +324,24 @@ class RotaryEmbedding:
                                       f"no rotary dimensions for head_dim {head_dim}")
 
         half     = self.rotary_dim // 2
-        inv_freq = 1.0 / (theta ** (cupy.arange(half, dtype = FLOAT_TYPE) * 2.0 / self.rotary_dim))
+        inv_freq = 1.0 / (theta ** (xp.arange(half, dtype = FLOAT_TYPE) * 2.0 / self.rotary_dim))
 
         if proportional:
             # Frequencies use the full head width; active pairs straddle its halves.
-            inv_freq = 1.0 / (theta ** (cupy.arange(half, dtype = FLOAT_TYPE) * 2.0 / head_dim))
-            inv_freq = cupy.concatenate((inv_freq, init_zeros_tensor(head_dim // 2 - half)))
+            inv_freq = 1.0 / (theta ** (xp.arange(half, dtype = FLOAT_TYPE) * 2.0 / head_dim))
+            inv_freq = xp.concatenate((inv_freq, init_zeros_tensor(head_dim // 2 - half)))
             self.rotary_dim = head_dim
 
-        angles = cupy.arange(context_length, dtype = FLOAT_TYPE)[:, None] * inv_freq[None, :]
-        angles = cupy.concatenate((angles, angles), axis = -1)
+        angles = xp.arange(context_length, dtype = FLOAT_TYPE)[:, None] * inv_freq[None, :]
+        angles = xp.concatenate((angles, angles), axis = -1)
 
-        self.cos = cupy.cos(angles).astype(FLOAT_TYPE, copy = False)
-        self.sin = cupy.sin(angles).astype(FLOAT_TYPE, copy = False)
+        self.cos = xp.cos(angles).astype(FLOAT_TYPE, copy = False)
+        self.sin = xp.sin(angles).astype(FLOAT_TYPE, copy = False)
 
     @staticmethod
     def _rotate_half(x):
         half = x.shape[-1] // 2
-        return cupy.concatenate((-x[..., half:], x[..., :half]), axis = -1)
+        return xp.concatenate((-x[..., half:], x[..., :half]), axis = -1)
 
     def rotate(self, x, offset = 0):
 
@@ -355,7 +353,7 @@ class RotaryEmbedding:
             return x * cos + self._rotate_half(x) * sin
 
         rotated = x[..., :self.rotary_dim] * cos + self._rotate_half(x[..., :self.rotary_dim]) * sin
-        return cupy.concatenate((rotated, x[..., self.rotary_dim:]), axis = -1)
+        return xp.concatenate((rotated, x[..., self.rotary_dim:]), axis = -1)
 
     def backward(self, gradient, offset = 0):
 
@@ -368,7 +366,7 @@ class RotaryEmbedding:
             return gradient * cos - self._rotate_half(gradient) * sin
 
         rotated = gradient[..., :self.rotary_dim] * cos - self._rotate_half(gradient[..., :self.rotary_dim]) * sin
-        return cupy.concatenate((rotated, gradient[..., self.rotary_dim:]), axis = -1)
+        return xp.concatenate((rotated, gradient[..., self.rotary_dim:]), axis = -1)
 
 class MultiHeadAttention(Layer):
 
@@ -386,14 +384,19 @@ class MultiHeadAttention(Layer):
     result as both key and value. The value branches off before q/k norm and RoPE,
     then optionally receives its own unweighted RMSNorm via v_norm=True.
     attention_scale=None preserves inverse-square-root scaling; Gemma 4 uses 1.0.
+    bias enables projection biases. attn_dropout_rate drops attention probabilities;
+    res_dropout_rate drops the projected attention output before its residual add.
+    eps configures every enabled Q/K/V RMSNorm.
     """
 
-    CACHED = ("input", "output", "query", "key", "value", "softmax", "chunks", "heads_out")
+    CACHED = ("input", "output", "query", "key", "value", "softmax", "chunks", "heads_out", "attn_masks")
 
     def __init__(self, embedding_dim, context_length, num_heads, decoder = False,
                        num_kv_heads = None, head_dim = None, qk_norm = False,
                        rope = None, sliding_window = None, kv_shared = False,
-                       chunk_size = None, attention_scale = None, v_norm = False):
+                       chunk_size = None, attention_scale = None, v_norm = False,
+                       bias = False, attn_dropout_rate = 0.0, res_dropout_rate = 0.0,
+                       eps = 1e-6):
         super(MultiHeadAttention, self).__init__()
 
         self.embedding_dim  = embedding_dim
@@ -433,12 +436,15 @@ class MultiHeadAttention(Layer):
         self.softmax = None   # list of per block attention weights
         self.chunks  = None   # list of (q0, q1, k0, k1) bounds matching self.softmax
         self.heads_out = None
+        self.attn_masks = None
+        self.attn_dropout = Dropout(attn_dropout_rate)
+        self.res_dropout = Dropout(res_dropout_rate)
 
         self.is_decoder = decoder
 
-        self.q_norm = RMSNorm(self.heads_dim) if qk_norm else None
-        self.k_norm = RMSNorm(self.heads_dim) if qk_norm else None
-        self.v_norm = RMSNorm(self.heads_dim, with_scale = False) if v_norm else None
+        self.q_norm = RMSNorm(self.heads_dim, eps=eps) if qk_norm else None
+        self.k_norm = RMSNorm(self.heads_dim, eps=eps) if qk_norm else None
+        self.v_norm = RMSNorm(self.heads_dim, eps=eps, with_scale = False) if v_norm else None
 
         if self.fused:
             self.qkv_weights = init_weight_tensor((embedding_dim, 3*embedding_dim), embedding_dim**0.5)
@@ -456,6 +462,14 @@ class MultiHeadAttention(Layer):
 
         self.out_weights = init_weight_tensor((self.query_dim, embedding_dim), self.query_dim**0.5)
         self.out_weight_grads = self.register(self.out_weights)
+
+        projections = ([('qkv', 3 * embedding_dim)] if self.fused else
+                       [('q', self.query_dim), ('k', self.kv_dim)] +
+                       ([] if kv_shared else [('v', self.kv_dim)]))
+        for name, width in projections + [('out', embedding_dim)]:
+            tensor = init_zeros_tensor(width) if bias else None
+            setattr(self, name + '_bias', tensor)
+            setattr(self, name + '_bias_grads', self.register(tensor) if bias else None)
 
         # the q/k norms own their own parameters; surface them through this layer so
         # the optimizer sees one flat set of parallel lists
@@ -508,23 +522,17 @@ class MultiHeadAttention(Layer):
         signature  = (rows_ahead, q1 - q0, width, self.sliding_window)
 
         if signature not in _BLOCK_MASKS:
-            rows = cupy.arange(q1 - q0)[:, None] + rows_ahead
-            cols = cupy.arange(width)[None, :]
+            rows = xp.arange(q1 - q0)[:, None] + rows_ahead
+            cols = xp.arange(width)[None, :]
 
             allowed = cols <= rows
             if self.sliding_window is not None:
                 allowed = allowed & ((rows - cols) < self.sliding_window)
 
             _BLOCK_MASKS[signature] = (None if bool(allowed.all()) else
-                                       cupy.where(allowed, 0.0, -1e9).astype(FLOAT_TYPE, copy = False))
+                                       xp.where(allowed, 0.0, -1e9).astype(FLOAT_TYPE, copy = False))
 
         return _BLOCK_MASKS[signature], offset
-
-    def clear_cache(self):
-        super(MultiHeadAttention, self).clear_cache()
-        for norm in (self.q_norm, self.k_norm, self.v_norm):
-            if norm is not None:
-                norm.clear_cache()
 
     def start_cache(self, batch_size, max_length, step = 1):
 
@@ -561,11 +569,18 @@ class MultiHeadAttention(Layer):
 
         if self.fused:
             qkv = self.input @ self.qkv_weights
-            query, key, value = cupy.split(qkv, 3, axis = 2)
+            if self.qkv_bias is not None:
+                qkv = qkv + self.qkv_bias
+            query, key, value = xp.split(qkv, 3, axis = 2)
         else:
             query = self.input @ self.q_weights
             key   = self.input @ self.k_weights
+            if self.q_bias is not None:
+                query = query + self.q_bias
+                key = key + self.k_bias
             value = key if self.kv_shared else self.input @ self.v_weights
+            if not self.kv_shared and self.v_bias is not None:
+                value = value + self.v_bias
 
         query = self._split_heads(query, self.num_kv_heads, self.groups)
         key   = self._split_heads(key,   self.num_kv_heads, 1)
@@ -599,6 +614,7 @@ class MultiHeadAttention(Layer):
 
         step = self.chunk_size or T
         self.softmax, self.chunks, outputs = [], [], []
+        self.attn_masks = []
 
         for q0 in range(0, T, step):
 
@@ -617,18 +633,25 @@ class MultiHeadAttention(Layer):
                 if mask is not None:
                     attends[..., offset:] += mask
 
-            normalization = cupy.max(attends, axis = -1, keepdims = True)
-            exponent      = cupy.exp(attends - normalization)
-            attends       = exponent / cupy.sum(exponent, axis = -1, keepdims=True)
+            normalization = xp.max(attends, axis = -1, keepdims = True)
+            exponent      = xp.exp(attends - normalization)
+            attends       = exponent / xp.sum(exponent, axis = -1, keepdims=True)
 
             self.softmax.append(attends)
             self.chunks.append((a0, a1, k0, k1))
-            outputs.append(attends @ self.value[:, :, :, k0-base:k1-base, :])
+            dropped = self.attn_dropout.forward(attends)
+            # Each query chunk needs its own mask in backward; Dropout only keeps
+            # its most recent forward, so retain the mask alongside the softmax.
+            self.attn_masks.append(self.attn_dropout.dropout_neurons)
+            outputs.append(dropped @ self.value[:, :, :, k0-base:k1-base, :])
 
         self.heads_out = self._merge_heads(outputs[0] if len(outputs) == 1 else
-                                           cupy.concatenate(outputs, axis = -2))
+                                           xp.concatenate(outputs, axis = -2))
 
         self.output = self.heads_out @ self.out_weights
+        if self.out_bias is not None:
+            self.output = self.output + self.out_bias
+        self.output = self.res_dropout.forward(self.output)
 
         if self.cache is not None:
             self.cache.position = end
@@ -644,7 +667,10 @@ class MultiHeadAttention(Layer):
                                "keys and values computed by earlier forwards, which have no "
                                "gradient path back to this one. Call stop_cache() first.")
 
-        self.out_weight_grads += cupy.tensordot(self.heads_out.transpose(2, 0, 1), gradient, 2) / T
+        gradient = self.res_dropout.backward(gradient)
+        self.out_weight_grads += xp.tensordot(self.heads_out.transpose(2, 0, 1), gradient, 2)
+        if self.out_bias is not None:
+            self.out_bias_grads += gradient.sum(axis=(0, 1))
         gradient = gradient @ self.out_weights.transpose()
 
         gradient = self._split_heads(gradient, self.num_kv_heads, self.groups)
@@ -653,16 +679,19 @@ class MultiHeadAttention(Layer):
         key_grads   = init_zeros_tensor(self.key.shape)
         value_grads = init_zeros_tensor(self.value.shape)
 
-        for attends, (q0, q1, k0, k1) in zip(self.softmax, self.chunks):
+        for attends, mask, (q0, q1, k0, k1) in zip(self.softmax, self.attn_masks, self.chunks):
 
             block = gradient[:, :, :, q0:q1, :]
 
             # key and value ranges overlap between query blocks so they accumulate, and
             # every query head in a group reads the same kv head, so the group axis
             # folds back onto that one head
-            value_grads[:, :, :, k0:k1, :] += (attends.transpose(0, 1, 2, 4, 3) @ block).sum(axis = 2, keepdims = True)
+            dropped = attends if mask is None else attends * mask
+            value_grads[:, :, :, k0:k1, :] += (dropped.transpose(0, 1, 2, 4, 3) @ block).sum(axis = 2, keepdims = True)
 
             block = block @ self.value[:, :, :, k0:k1, :].transpose(0, 1, 2, 4, 3)
+            if mask is not None:
+                block = block * mask
             block = attends * ( block - (block * attends).sum(axis = -1, keepdims=True))
             block = (block / self.heads_dim**.5 if self.attention_scale is None else
                      block * self.attention_scale)
@@ -689,34 +718,63 @@ class MultiHeadAttention(Layer):
         value_grads = self._merge_heads(value_grads)
 
         if self.fused:
-            gradient = cupy.concatenate((query_grads, key_grads, value_grads), axis = 2)
-            self.qkv_weight_grads += cupy.tensordot(self.input.transpose(2, 0, 1), gradient, 2) / T
+            gradient = xp.concatenate((query_grads, key_grads, value_grads), axis = 2)
+            self.qkv_weight_grads += xp.tensordot(self.input.transpose(2, 0, 1), gradient, 2)
+            if self.qkv_bias is not None:
+                self.qkv_bias_grads += gradient.sum(axis=(0, 1))
             return gradient @ self.qkv_weights.transpose()
 
         if self.kv_shared:
             # one projection served as both key and value, so both paths accumulate onto it
             key_grads = key_grads + value_grads
 
-        self.q_weight_grads += cupy.tensordot(self.input.transpose(2, 0, 1), query_grads, 2) / T
-        self.k_weight_grads += cupy.tensordot(self.input.transpose(2, 0, 1), key_grads,   2) / T
+        self.q_weight_grads += xp.tensordot(self.input.transpose(2, 0, 1), query_grads, 2)
+        self.k_weight_grads += xp.tensordot(self.input.transpose(2, 0, 1), key_grads,   2)
+        if self.q_bias is not None:
+            self.q_bias_grads += query_grads.sum(axis=(0, 1))
+            self.k_bias_grads += key_grads.sum(axis=(0, 1))
 
         gradient = query_grads @ self.q_weights.transpose() + key_grads @ self.k_weights.transpose()
 
         if not self.kv_shared:
-            self.v_weight_grads += cupy.tensordot(self.input.transpose(2, 0, 1), value_grads, 2) / T
+            self.v_weight_grads += xp.tensordot(self.input.transpose(2, 0, 1), value_grads, 2)
+            if self.v_bias is not None:
+                self.v_bias_grads += value_grads.sum(axis=(0, 1))
             gradient = gradient + value_grads @ self.v_weights.transpose()
 
         return gradient
 
-class GatedFeedForward(Layer):
+    def clear_cache(self):
+        super(MultiHeadAttention, self).clear_cache()
+        for child in (self.q_norm, self.k_norm, self.v_norm, self.attn_dropout, self.res_dropout):
+            if child is not None:
+                child.clear_cache()
+
+    def set_eval(self, eval_mode):
+        super(MultiHeadAttention, self).set_eval(eval_mode)
+        for child in (self.q_norm, self.k_norm, self.v_norm, self.attn_dropout, self.res_dropout):
+            if child is not None:
+                child.set_eval(eval_mode)
+
+class TransformerFeedForward(Layer):
+
+    """Transformer MLP with optional activation-based GLU gating.
+
+    hidden_dropout_rate applies after activation/gating, output_dropout_rate after the
+    down projection. GLU is disabled by default; enabling it preserves the gated parameter layout.
+    bias enables both projection biases (and the gate bias when glu=True).
+    """
 
     CACHED = ("input", "output", "act_output", "gate_output", "hidden_output")
 
-    def __init__(self, num_channels, activation, dropout_rate = 0.0, multiplier = 4):
-        super(GatedFeedForward, self).__init__()
+    def __init__(self, num_channels, activation, hidden_dropout_rate = 0.0, multiplier = 4,
+                       glu = False, output_dropout_rate = 0.0, bias = False):
+        super(TransformerFeedForward, self).__init__()
         
+        self.glu = glu
         self.activation:Layer = activation()
-        self.dropout = Dropout(dropout_rate)
+        self.dropout = Dropout(hidden_dropout_rate)
+        self.output_dropout = Dropout(output_dropout_rate)
 
         hidden_channels = multiplier * num_channels
         
@@ -724,23 +782,43 @@ class GatedFeedForward(Layer):
         self.gate_output = None
         self.hidden_output = None
 
-        self.weights1 = init_weight_tensor((num_channels,    hidden_channels), num_channels**0.5)
-        self.weights2 = init_weight_tensor((num_channels,    hidden_channels), num_channels**0.5)
-        self.weights3 = init_weight_tensor((hidden_channels, num_channels), hidden_channels**0.5)
+        self.act_weights  = init_weight_tensor((num_channels, hidden_channels), num_channels**0.5)
+        self.gate_weights = init_weight_tensor((num_channels, hidden_channels), num_channels**0.5) if glu else None
+        self.out_weights  = init_weight_tensor((hidden_channels, num_channels), hidden_channels**0.5)
 
-        self.weight_grads1 = self.register(self.weights1)
-        self.weight_grads2 = self.register(self.weights2)
-        self.weight_grads3 = self.register(self.weights3)
+        self.act_bias  = init_zeros_tensor(hidden_channels) if bias else None
+        self.gate_bias = init_zeros_tensor(hidden_channels) if bias and glu else None
+        self.out_bias  = init_zeros_tensor(num_channels) if bias else None
+
+        self.act_weight_grads  = self.register(self.act_weights)
+        self.gate_weight_grads = self.register(self.gate_weights) if glu else None
+        self.out_weight_grads  = self.register(self.out_weights)
+
+        self.act_bias_grads = self.register(self.act_bias) if bias else None
+        self.gate_bias_grads = self.register(self.gate_bias) if bias and glu else None
+        self.out_bias_grads = self.register(self.out_bias) if bias else None
 
     def forward(self, input):
 
         self.input = input
         
-        self.act_output = self.activation.forward(self.input @ self.weights1)
-        self.gate_output = self.input @ self.weights2
+        activated = self.input @ self.act_weights
+        if self.act_bias is not None:
+            activated = activated + self.act_bias
+        self.act_output = self.activation.forward(activated)
+        hidden = self.act_output
         
-        self.hidden_output = self.dropout.forward(self.act_output * self.gate_output)
-        self.output = self.hidden_output @ self.weights3
+        if self.glu:
+            self.gate_output = self.input @ self.gate_weights
+            if self.gate_bias is not None:
+                self.gate_output = self.gate_output + self.gate_bias
+            hidden = hidden * self.gate_output
+        
+        self.hidden_output = self.dropout.forward(hidden)
+        self.output = self.hidden_output @ self.out_weights
+        if self.out_bias is not None:
+            self.output = self.output + self.out_bias
+        self.output = self.output_dropout.forward(self.output)
 
         return self.output
 
@@ -748,34 +826,52 @@ class GatedFeedForward(Layer):
         
         B, T, C = gradient.shape
 
-        self.weight_grads3 += cupy.tensordot(self.hidden_output.transpose(2, 0, 1), gradient, 2) / T
+        gradient = self.output_dropout.backward(gradient)
+        self.out_weight_grads += xp.tensordot(self.hidden_output.transpose(2, 0, 1), gradient, 2)
+        if self.out_bias is not None:
+            self.out_bias_grads += gradient.sum(axis=(0, 1))
         
-        gradient = self.dropout.backward(gradient @ self.weights3.transpose())
-        act_gradient = self.activation.backward(gradient * self.gate_output)
-        gate_gradient = gradient * self.act_output
+        gradient = self.dropout.backward(gradient @ self.out_weights.transpose())
+        act_gradient = self.activation.backward(gradient * self.gate_output if self.glu else gradient)
 
-        self.weight_grads1 += cupy.tensordot(self.input.transpose(2, 0, 1), act_gradient,  2) / T
-        self.weight_grads2 += cupy.tensordot(self.input.transpose(2, 0, 1), gate_gradient, 2) / T
+        self.act_weight_grads += xp.tensordot(self.input.transpose(2, 0, 1), act_gradient,  2)
+        if self.act_bias is not None:
+            self.act_bias_grads += act_gradient.sum(axis=(0, 1))
+        input_gradient = act_gradient @ self.act_weights.transpose()
+        if self.glu:
+            gate_gradient = gradient * self.act_output
+            self.gate_weight_grads += xp.tensordot(self.input.transpose(2, 0, 1), gate_gradient, 2)
+            if self.gate_bias is not None:
+                self.gate_bias_grads += gate_gradient.sum(axis=(0, 1))
+            input_gradient = input_gradient + gate_gradient @ self.gate_weights.transpose()
 
-        return act_gradient @ self.weights1.transpose() + gate_gradient @ self.weights2.transpose()
+        return input_gradient
 
     def clear_cache(self):
-        super(GatedFeedForward, self).clear_cache()
+        super(TransformerFeedForward, self).clear_cache()
         self.activation.clear_cache()
         self.dropout.clear_cache()
+        self.output_dropout.clear_cache()
 
     def set_eval(self, eval_mode):
+        super(TransformerFeedForward, self).set_eval(eval_mode)
+        self.activation.set_eval(eval_mode)
         self.dropout.set_eval(eval_mode)
+        self.output_dropout.set_eval(eval_mode)
+
+
+# Preserve existing imports; callers needing gating must pass glu=True.
+GatedFeedForward = TransformerFeedForward
 
 class LayerNorm(Layer):
 
     CACHED = ("input", "output", "mean", "var", "std", "centered", "normed")
 
-    def __init__(self, num_channels):
+    def __init__(self, num_channels, eps = 1e-5):
         super(LayerNorm, self).__init__()
 
         self.channels = num_channels
-        self.eps = 1e-5
+        self.eps = eps
 
         self.gamma = init_zeros_tensor(num_channels) + 1
         self.beta  = init_zeros_tensor(num_channels)
@@ -793,8 +889,8 @@ class LayerNorm(Layer):
 
         self.input = input
 
-        self.mean = cupy.mean(input, axis=-1, keepdims=True)
-        self.var  = cupy.var(input, axis=-1, keepdims=True)
+        self.mean = xp.mean(input, axis=-1, keepdims=True)
+        self.var  = xp.var(input, axis=-1, keepdims=True)
 
         self.centered = input - self.mean
 
@@ -808,14 +904,14 @@ class LayerNorm(Layer):
         
         B, T, C = gradient.shape
 
-        self.gamma_grads += cupy.sum(gradient * self.normed, axis=(0, 1)) / T
-        self.beta_grads  += cupy.sum(gradient, axis=(0, 1)) / T
+        self.gamma_grads += xp.sum(gradient * self.normed, axis=(0, 1))
+        self.beta_grads  += xp.sum(gradient, axis=(0, 1))
 
         gradient = gradient * self.gamma
         
-        gradient_normed = (gradient - cupy.mean(gradient, axis = -1, keepdims = True)) / self.std
+        gradient_normed = (gradient - xp.mean(gradient, axis = -1, keepdims = True)) / self.std
         
-        return gradient_normed - self.centered * (cupy.mean(gradient * self.centered, axis = -1, keepdims = True) / self.std**3)
+        return gradient_normed - self.centered * (xp.mean(gradient * self.centered, axis = -1, keepdims = True) / self.std**3)
 
 
 class Softcap(Layer):
@@ -838,7 +934,7 @@ class Softcap(Layer):
 
     def forward(self, input):
         self.input  = input
-        self.tanh   = cupy.tanh(input / self.cap)
+        self.tanh   = xp.tanh(input / self.cap)
         self.output = self.cap * self.tanh
         return self.output
 
@@ -858,30 +954,50 @@ class TransformerBlock(Layer):
 
     Attention keywords (num_kv_heads, head_dim, qk_norm, rope, sliding_window,
     kv_shared, chunk_size) pass straight through to MultiHeadAttention.
+    glu, hidden_dropout_rate and output_dropout_rate configure the feedforward branch;
+    output dropout precedes the optional post-FFN norm and residual addition.
+    attn_bias/ffn_bias enable projection biases independently. res_dropout_rate
+    applies to both branch outputs unless output_dropout_rate overrides the FFN.
+    attn_dropout_rate applies to the attention probabilities.
+    eps, when supplied, configures every residual and Q/K/V norm. None preserves
+    the norm factory's default and attention's default RMSNorm epsilon.
     """
 
     def __init__(self, embed_dim, context_length, num_heads, activation, decoder = False,
-                       dropout_rate = 0.0, norm = LayerNorm, post_norm = False, ffn_multiplier = 4,
+                       hidden_dropout_rate = 0.0, norm = LayerNorm, post_norm = False, ffn_multiplier = 4,
                        num_kv_heads = None, head_dim = None, qk_norm = False,
                        rope = None, sliding_window = None, kv_shared = False,
-                       chunk_size = None, attention_scale = None, v_norm = False):
+                       chunk_size = None, attention_scale = None, v_norm = False,
+                       glu = False, output_dropout_rate = None,
+                       attn_bias = False, ffn_bias = False,
+                       attn_dropout_rate = 0.0, res_dropout_rate = 0.0, eps = None):
         super(TransformerBlock, self).__init__()
+
+        if output_dropout_rate is None:
+            output_dropout_rate = res_dropout_rate
+
+        # None preserves each norm's existing default, including custom factories.
+        # An explicit epsilon reaches every residual and per-head norm.
+        norm_options = {} if eps is None else {'eps': eps}
 
         # Non-trainable checkpoint buffer, applied after both residual branches.
         self.layer_scalar = init_zeros_tensor(1) + 1
-        self.pre_attn_norm  = norm(embed_dim)
+        self.pre_attn_norm  = norm(embed_dim, **norm_options)
         self.attn_block     = MultiHeadAttention(embed_dim, context_length, num_heads, decoder = decoder,
                                                  num_kv_heads = num_kv_heads, head_dim = head_dim,
                                                  qk_norm = qk_norm, rope = rope,
                                                  sliding_window = sliding_window, kv_shared = kv_shared,
                                                  chunk_size = chunk_size,
-                                                 attention_scale = attention_scale, v_norm = v_norm)
-        self.post_attn_norm = norm(embed_dim) if post_norm else None
+                                                 attention_scale = attention_scale, v_norm = v_norm,
+                                                 bias = attn_bias, attn_dropout_rate = attn_dropout_rate,
+                                                 res_dropout_rate = res_dropout_rate, **norm_options)
+        self.post_attn_norm = norm(embed_dim, **norm_options) if post_norm else None
 
-        self.pre_ffn_norm  = norm(embed_dim)
-        self.ffn           = GatedFeedForward(embed_dim, activation, dropout_rate = dropout_rate,
-                                              multiplier = ffn_multiplier)
-        self.post_ffn_norm = norm(embed_dim) if post_norm else None
+        self.pre_ffn_norm  = norm(embed_dim, **norm_options)
+        self.ffn           = TransformerFeedForward(embed_dim, activation, hidden_dropout_rate = hidden_dropout_rate,
+                                                    multiplier = ffn_multiplier, glu = glu,
+                                                    output_dropout_rate = output_dropout_rate, bias = ffn_bias)
+        self.post_ffn_norm = norm(embed_dim, **norm_options) if post_norm else None
 
         self.blocks = [block for block in (self.pre_attn_norm, self.attn_block, self.post_attn_norm,
                                            self.pre_ffn_norm,  self.ffn,        self.post_ffn_norm)
@@ -939,7 +1055,9 @@ class TransformerBlock(Layer):
             block.stop_cache()
 
     def set_eval(self, eval_mode):
-        self.ffn.dropout.set_eval(eval_mode)
+        super(TransformerBlock, self).set_eval(eval_mode)
+        for block in self.blocks:
+            block.set_eval(eval_mode)
 
 
 def gemma_layer_types(num_layers, pattern = 6):

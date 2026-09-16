@@ -1,7 +1,6 @@
-from utils import init_weight_tensor
 from layers import RMSNorm, RotaryEmbedding, Softcap, TransformerBlock, gemma_layer_types
-from activations import GeLU, SoftMax
-from transformer_adapters import GPTEmbedFront, GPTEmbedBack
+from activations import GeLUTanh, SoftMax
+from transformer_adapters import GPTEmbeddingTable, GPTEmbedFront, GPTEmbedBack
 from network import Network
 
 
@@ -62,7 +61,7 @@ def gemma_gpt(vocab_size, context_length, num_layers, embed_dim, num_heads, head
               sliding_window = 1024, pattern = 6, ffn_multiplier = 4,
               local_theta = 10000.0, global_theta = 1000000.0, global_partial_rotary = 0.25,
               logit_softcap = 30.0, qk_norm = True, post_norm = True, kv_shared_global = True,
-              chunk_size = None, dropout_rate = 0.0, activation = GeLU, embedding_table = None,
+              chunk_size = None, hidden_dropout_rate = 0.0, activation = GeLUTanh, embedding_table = None,
               layer_types = None, rms_norm_eps = 1e-6):
 
     """Assemble a Gemma 4 shaped decoder.
@@ -88,10 +87,13 @@ def gemma_gpt(vocab_size, context_length, num_layers, embed_dim, num_heads, head
     global_head_dim     = head_dim     if global_head_dim     is None else global_head_dim
     num_global_kv_heads = num_kv_heads if num_global_kv_heads is None else num_global_kv_heads
 
-    if embedding_table is None:
+    if not isinstance(embedding_table, GPTEmbeddingTable):
         # scaled so that the sqrt(embed_dim) multiply in GPTEmbedFront lands the
         # embeddings at unit scale on the residual stream
-        embedding_table = init_weight_tensor((vocab_size, embed_dim), embed_dim**0.5)
+        embedding_table = GPTEmbeddingTable(vocab_size, embed_dim, table=embedding_table,
+                                            scale=embed_dim**0.5)
+    elif embedding_table.table.shape != (vocab_size, embed_dim):
+        raise ValueError("embedding table shape must match vocab_size and embed_dim")
 
     local_rope  = RotaryEmbedding(head_dim, context_length, theta = local_theta)
     global_rope = RotaryEmbedding(global_head_dim, context_length, theta = global_theta,
@@ -103,8 +105,9 @@ def gemma_gpt(vocab_size, context_length, num_layers, embed_dim, num_heads, head
     for kind in (layer_types if layer_types is not None else gemma_layer_types(num_layers, pattern)):
         is_global = kind == "global"
         stack.append(TransformerBlock(
-            embed_dim, context_length, num_heads, activation, decoder = True,
-            dropout_rate = dropout_rate, norm = RMSNorm, post_norm = post_norm,
+            embed_dim, context_length, num_heads, activation, decoder = True, glu = True,
+            hidden_dropout_rate = hidden_dropout_rate, norm = RMSNorm, post_norm = post_norm,
+            eps = rms_norm_eps,
             ffn_multiplier = ffn_multiplier,
             num_kv_heads   = num_global_kv_heads if is_global else num_kv_heads,
             head_dim       = global_head_dim     if is_global else head_dim,
@@ -116,7 +119,7 @@ def gemma_gpt(vocab_size, context_length, num_layers, embed_dim, num_heads, head
             kv_shared      = kv_shared_global and is_global,
             chunk_size     = chunk_size or None))
 
-    stack.append(RMSNorm(embed_dim))
+    stack.append(RMSNorm(embed_dim, eps=rms_norm_eps))
     stack.append(GPTEmbedBack(embedding_table))
 
     if logit_softcap:
@@ -124,15 +127,6 @@ def gemma_gpt(vocab_size, context_length, num_layers, embed_dim, num_heads, head
 
     stack.append(SoftMax())
 
-    # Apply the checkpoint epsilon to residual norms and per-head Q/K/V norms.
-    for layer in stack:
-        norms = [layer] if isinstance(layer, RMSNorm) else []
-        if isinstance(layer, TransformerBlock):
-            norms += [n for n in layer.blocks if isinstance(n, RMSNorm)]
-            norms += [layer.attn_block.q_norm, layer.attn_block.k_norm, layer.attn_block.v_norm]
-        for norm in norms:
-            if norm is not None:
-                norm.eps = rms_norm_eps
     model = Network(stack)
     model.context_length = context_length
     return model

@@ -1,6 +1,6 @@
 """Gradient checks for the Gemma 4 style layers.
 
-Runs on CPU: it substitutes numpy for cupy and switches FLOAT_TYPE to float64, since
+Runs on CPU: it selects the NumPy backend and switches FLOAT_TYPE to float64, since
 central differences are far too noisy to validate a backward pass in float32.
 
     python test_gemma.py
@@ -10,24 +10,25 @@ the model still trains, just towards the wrong thing. These checks compare each
 analytic gradient against a finite difference of the forward pass.
 """
 
-import sys, types
+import os, sys, types
 import numpy as np
 
-sys.modules.setdefault('cupy', np)
+os.environ['TORCHLESS_BACKEND'] = 'numpy'
 if 'cv2' not in sys.modules: # only used by utils.augment_images, never called here
     sys.modules['cv2'] = types.ModuleType('cv2')
 
-import utils
-utils.FLOAT_TYPE = np.float64
-import layers, transformer_adapters, network
-for module in (layers, transformer_adapters, network):
+import backend
+backend.FLOAT_TYPE = np.float64
+import utils, layers, transformer_adapters, network
+for module in (utils, layers, transformer_adapters, network):
     module.FLOAT_TYPE = np.float64
 
 from layers import (MultiHeadAttention, GatedFeedForward, LayerNorm, RMSNorm, Softcap, Dense,
                     RotaryEmbedding, TransformerBlock, gemma_layer_types)
-from activations import SiLU, GeLU
+from activations import SiLU, GeLU, GeLUTanh
 from gemma import gemma_gpt, gemma_parameter_count, GEMMA_4_31B, GEMMA_4_12B
 from network import CrossEntropy
+from transformer_adapters import VitProjector, VitMLPHead, GPTEmbeddingTable, GPTEmbedFront, GPTEmbedBack
 
 PASSED, FAILED = [], []
 
@@ -45,11 +46,14 @@ def relerr(a, b):
     return float(np.max(np.abs(a - b)) / scale)
 
 
-def numgrad(f, x, eps = 1e-5):
+def numgrad(f, x, eps = 1e-5, trainable_mask = None):
     grad = np.zeros_like(x)
     it = np.nditer(x, flags = ['multi_index'])
     while not it.finished:
         i = it.multi_index
+        if trainable_mask is not None and not trainable_mask[i]:
+            it.iternext()
+            continue
         old = x[i]
         x[i] = old + eps; plus  = f()
         x[i] = old - eps; minus = f()
@@ -59,13 +63,14 @@ def numgrad(f, x, eps = 1e-5):
     return grad
 
 
-def check_layer(name, layer, x, seed = 1234, tol = 1e-7):
+def check_layer(name, layer, x, seed = 1234, tol = 1e-7, parameter_owner = None,
+                parameter_masks = None):
     """Compare analytic against numeric gradients for the input and every parameter.
 
-    The library scales weight gradients by a constant (it averages over the sequence
-    axis, and over head axes inside QK norm), so rather than hard coding that we fit
-    the single scalar c in analytic = numeric / c and require the fit to be exact.
-    A wrong backward pass will not fit one constant across every entry.
+    Backward differentiates the summed loss without per-layer normalization.
+    Check gradient magnitudes directly; the optimizer alone averages over labels.
+    Optional masks keyed by parameter identity exclude frozen entries from numeric
+    perturbations, while still requiring their analytic gradients to be zero.
     """
     # this seed must differ from whatever produced x: if the upstream gradient equals
     # the input, a normalization layer's Jacobian cancels to ~0 and the test is vacuous
@@ -74,18 +79,18 @@ def check_layer(name, layer, x, seed = 1234, tol = 1e-7):
     def loss():
         return float(np.sum(layer.forward(x) * up))
 
-    layer.zero_grad()
+    parameter_owner = layer if parameter_owner is None else parameter_owner
+    parameter_owner.zero_grad()
     layer.forward(x)
     dx = layer.backward(up.copy())
 
     worst = 0.0
     if dx is not None:
         worst = relerr(dx, numgrad(loss, x))
-    for p, g in zip(layer.parameters, layer.gradients):
-        ng = numgrad(loss, p)
-        denom = float(np.sum(g * g))
-        c = float(np.sum(ng * g)) / denom if denom > 0 else 1.0
-        worst = max(worst, relerr(g * c, ng))
+    for p, g in zip(parameter_owner.parameters, parameter_owner.gradients):
+        mask = None if parameter_masks is None else parameter_masks.get(id(p))
+        ng = numgrad(loss, p, trainable_mask = mask)
+        worst = max(worst, relerr(g, ng))
 
     record(name, worst < tol, f"worst relerr {worst:.1e}")
 
@@ -94,7 +99,75 @@ rng = np.random.default_rng(7)
 B, T, C, H = 2, 6, 12, 4
 x = rng.standard_normal((B, T, C))
 
+def check_vit_projector(cls_token, num_registers):
+    name = f"ViT patch projection (cls={cls_token}, registers={num_registers})"
+    local_rng = np.random.default_rng(71)
+    layer = VitProjector((2, 4, 6), (2, 3), 4,
+                         num_registers=num_registers, cls_token=cls_token)
+    images = local_rng.standard_normal((2, 2, 4, 6))
+    register_rows = slice(int(cls_token), int(cls_token) + num_registers)
+    trainable = np.ones(layer.positional_encodings.shape, dtype=bool)
+    trainable[register_rows] = False
+    # Registers use frozen zero padding so forward can add positions in one call.
+    layer.positional_encodings[trainable] = local_rng.standard_normal(trainable.sum())
+    layer.projection_bias[:] = local_rng.standard_normal(4)
+    check_layer(name, layer, images,
+                parameter_masks={id(layer.positional_encodings): trainable})
+
+    # Independently extract rectangular, multichannel patches in spatial order.
+    patches = np.stack([images[:, :, y:y+2, z:z+3].transpose(0, 2, 3, 1).reshape(2, -1)
+                        for y in range(0, 4, 2) for z in range(0, 6, 3)], axis=1)
+    expected = patches @ layer.projection_weights + layer.projection_bias
+    prefix_size = int(cls_token) + num_registers
+    if prefix_size:
+        prefix = np.broadcast_to(layer.cls_reg_tokens, (2, prefix_size, 4))
+        expected = np.concatenate((prefix, expected), axis=1)
+    expected += layer.positional_encodings
+    record(name + " forward and repeated calls",
+           all(np.allclose(layer.forward(images), expected, rtol=1e-12, atol=1e-12)
+               for _ in range(2)))
+
+    model = network.Network([layer])
+    positions_before = layer.positional_encodings.copy()
+    frozen_ok = True
+    accumulation_ok = True
+    position_index = next(i for i, p in enumerate(layer.parameters)
+                          if p is layer.positional_encodings)
+    for step in range(1, 4):
+        layer.zero_grad()
+        expected_grad = np.zeros_like(layer.positional_encodings)
+        for batch in (images[:1], images[1:]):
+            upstream = local_rng.standard_normal(layer.forward(batch).shape)
+            layer.backward(upstream)
+            expected_grad += upstream.sum(axis=0)
+        expected_grad[register_rows] = 0
+        accumulation_ok &= np.allclose(layer.positional_encoding_grads, expected_grad)
+        frozen_ok &= not np.any(layer.positional_encoding_grads[register_rows])
+        model._update(.003, .01, step, num_samples=2)
+        for array in (layer.positional_encodings, layer.moments[position_index],
+                      layer.variances[position_index]):
+            frozen_ok &= not np.any(array[register_rows])
+    record(name + " positional gradient accumulation", accumulation_ok)
+    record(name + " frozen positions through Adam updates",
+           frozen_ok and np.any(layer.positional_encodings[trainable] != positions_before[trainable]))
+
+
+print("image and text adapters:")
+for cls_token in (True, False):
+    for num_registers in (0, 2):
+        check_vit_projector(cls_token, num_registers)
+check_layer("ViT class token head", VitMLPHead(4, 3), rng.standard_normal((2, 6, 4)))
+check_layer("scaled token embedding with repeated IDs", GPTEmbedFront(
+    GPTEmbeddingTable(5, 4, table=rng.standard_normal((5, 4))),
+    3, positional="none", scale_embeddings=True),
+    np.array([[1, 1, 2], [2, 3, 1]]))
+output_table = GPTEmbeddingTable(5, 4, table=rng.standard_normal((5, 4)))
+check_layer("token output projection", GPTEmbedBack(output_table),
+            rng.standard_normal((2, 3, 4)), parameter_owner=output_table)
+
 print("norms, softcap:")
+check_layer("exact GELU", GeLU(), x.copy())
+check_layer("tanh GELU", GeLUTanh(), x.copy())
 check_layer("RMSNorm over (batch, sequence, channels)", RMSNorm(C), x.copy())
 check_layer("RMSNorm over (batch, kv, group, sequence, dim)", RMSNorm(4),
             rng.standard_normal((2, 3, 2, 6, 4)))
@@ -123,12 +196,13 @@ check_layer("p-RoPE", MultiHeadAttention(C, T, H, decoder = True, num_kv_heads =
                                                                 partial_rotary_factor = 0.25)), x.copy())
 
 print("\ntransformer blocks:")
-check_layer("TransformerBlock, original defaults", TransformerBlock(C, T, H, SiLU, decoder = True), x.copy())
+check_layer("TransformerBlock, gated FFN", TransformerBlock(C, T, H, SiLU, decoder = True, glu = True), x.copy())
+check_layer("TransformerBlock, ungated FFN", TransformerBlock(C, T, H, GeLU, glu = False), x.copy())
 check_layer("Gemma sliding block", TransformerBlock(
-    C, T, H, GeLU, decoder = True, norm = RMSNorm, post_norm = True, num_kv_heads = 2,
+    C, T, H, GeLUTanh, decoder = True, glu = True, norm = RMSNorm, post_norm = True, num_kv_heads = 2,
     head_dim = 8, qk_norm = True, rope = RotaryEmbedding(8, T), sliding_window = 4), x.copy())
 check_layer("Gemma global block (K=V, p-RoPE)", TransformerBlock(
-    C, T, H, GeLU, decoder = True, norm = RMSNorm, post_norm = True, num_kv_heads = 1,
+    C, T, H, GeLUTanh, decoder = True, glu = True, norm = RMSNorm, post_norm = True, num_kv_heads = 1,
     head_dim = 8, qk_norm = True, kv_shared = True,
     rope = RotaryEmbedding(8, T, theta = 1e6, partial_rotary_factor = 0.25)), x.copy())
 
@@ -139,7 +213,7 @@ check_layer("Gemma 4 normalized values and unit attention scale", MultiHeadAtten
     C, T, H, decoder = True, num_kv_heads = 1, head_dim = 8,
     qk_norm = True, v_norm = True, kv_shared = True, attention_scale = 1.0,
     rope = RotaryEmbedding(8, T, partial_rotary_factor = 0.25, proportional = True)), x.copy())
-scaled_block = TransformerBlock(C, T, H, GeLU, decoder = True)
+scaled_block = TransformerBlock(C, T, H, GeLUTanh, decoder = True, glu = True)
 scaled_block.layer_scalar[...] = 0.7
 check_layer("checkpoint layer scalar backward", scaled_block, x.copy())
 
@@ -416,8 +490,8 @@ def exact_loss():
 model._zero_grad()
 model._backward(criterion.gradients(model._forward(data), labels))
 
-# the embedding table is tied across GPTEmbedFront and GPTEmbedBack, which keep
-# separate gradient buffers, so a finite difference on it sees both paths at once
+# The shared embedding gradient includes both lookup and unembedding paths,
+# and its optimizer state is registered once through GPTEmbedFront.
 by_array = {}
 for layer in model.layers:
     for p, g in zip(layer.parameters, layer.gradients):
@@ -435,8 +509,7 @@ for p, grads in by_array.values():
     if abs(analytic) < 1e-14 and abs(numeric) < 1e-9:
         consistent += 1
         continue
-    ratio = numeric / analytic
-    consistent += any(abs(ratio - c) < 2e-4 * max(1, c) for c in (1, seq, 2*seq, 4*seq, 8*seq, 16*seq))
+    consistent += np.isclose(analytic, numeric, rtol=2e-4, atol=1e-8)
 record("full stack gradients agree with finite differences",
        consistent == len(by_array), f"{consistent}/{len(by_array)} parameter arrays")
 
@@ -533,7 +606,6 @@ for window in (5, None):
 # absolute encodings, and a prefill that ends on a single token hides the slice
 from network import Network as _Network
 from transformer_adapters import GPTEmbedFront as _Front, GPTEmbedBack as _Back
-from utils import init_random_tensor as _init
 from activations import SoftMax as _SoftMax
 
 def positionwise_cache_equivalent(name, build, prefill, length = 9, B = 2, V = 16):
@@ -561,10 +633,10 @@ def positionwise_cache_equivalent(name, build, prefill, length = 9, B = 2, V = 1
     record(name, err < 1e-13, f"relerr {err:.1e} over {len(seen)} positions")
 
 def plain_gpt(positional):
-    table = _init((16, 32))
+    table = GPTEmbeddingTable(16, 32)
     return _Network([_Front(table, 16, positional = positional),
-                     TransformerBlock(32, 16, 4, SiLU, decoder = True),
-                     TransformerBlock(32, 16, 4, SiLU, decoder = True),
+                     TransformerBlock(32, 16, 4, SiLU, decoder = True, glu = True),
+                     TransformerBlock(32, 16, 4, SiLU, decoder = True, glu = True),
                      LayerNorm(32), _Back(table), _SoftMax()])
 
 positionwise_cache_equivalent("cached logits match at every position, sinusoidal GPT",

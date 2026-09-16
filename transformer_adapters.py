@@ -1,38 +1,50 @@
-import cupy
+from backend import xp, FLOAT_TYPE
 
-from utils import Layer, FLOAT_TYPE, init_random_tensor, init_zeros_tensor, scatter_add
+from utils import Layer, init_random_tensor, init_zeros_tensor, init_weight_tensor
 
 class VitProjector(Layer):
 
     CACHED = ("input", "output", "tokens", "embeddings")
 
-    def __init__(self, input_size:tuple, patch_size:tuple, embedding_dim, num_registers = 0):
+    def __init__(self, input_size:tuple, patch_size:tuple, embedding_dim, num_registers = 0, cls_token = True):
         super(VitProjector, self).__init__()
 
         self.batch_size = 0
         self.channels, self.height, self.width = input_size
         self.patch_size = patch_size
+        self.embedding_dim = embedding_dim
+        self.num_registers = num_registers
+        self.cls_token = cls_token
 
         self.patches_height = self.height // self.patch_size[0]
         self.patches_width  = self.width  // self.patch_size[1]
 
         self.sequence_length = self.patches_height * self.patches_width
         self.token_dim = self.patch_size[0] * self.patch_size[1] * self.channels
-        self.embedding_dim = embedding_dim
-        self.cls_reg_size = 1 + num_registers
+
+        self.cls_size = int(self.cls_token)
+        self.cls_reg_size = self.cls_size + self.num_registers
+        self.total_length = self.cls_reg_size + self.sequence_length
 
         self.tokens = None
         self.embeddings = None
 
-        self.projection            = init_random_tensor((self.token_dim,    self.embedding_dim)) / self.token_dim**0.5
-        self.cls_reg_tokens        = init_random_tensor((self.cls_reg_size, self.embedding_dim)) / self.embedding_dim**0.5
-        self.positional_embeddings = init_zeros_tensor((self.cls_reg_size + self.sequence_length, self.embedding_dim))
+        self.projection_weights    = init_weight_tensor((self.token_dim, self.embedding_dim), self.token_dim**0.5)
+        self.projection_bias       = init_zeros_tensor(self.embedding_dim)
 
-        
-        
-        self.projection_grads            = self.register(self.projection)
-        self.cls_reg_token_grads         = self.register(self.cls_reg_tokens)
-        self.positional_embeddings_grads = self.register(self.positional_embeddings)
+        if self.cls_reg_size:
+            self.cls_reg_tokens = init_weight_tensor((self.cls_reg_size, self.embedding_dim), self.embedding_dim**0.5)
+
+        # Register rows stay frozen at zero, allowing one positional add for all tokens.
+        self.positional_encodings  = init_zeros_tensor((self.total_length, self.embedding_dim))
+
+        self.projection_grads           = self.register(self.projection_weights)
+        self.projection_bias_grads      = self.register(self.projection_bias)
+
+        if self.cls_reg_size:
+            self.cls_reg_token_grads    = self.register(self.cls_reg_tokens)
+
+        self.positional_encoding_grads  = self.register(self.positional_encodings)
 
     def forward(self, input):
 
@@ -45,34 +57,56 @@ class VitProjector(Layer):
                                       self.patches_width, self.patch_size[1]))
 
         permute = reshape.transpose(0,2,4,3,5,1)
+
         self.tokens = permute.reshape(self.batch_size,
                                       self.sequence_length,
                                       self.token_dim)
 
-        self.embeddings = self.tokens @ self.projection
+        self.embeddings = self.tokens @ self.projection_weights + self.projection_bias
 
-        class_token_batch = cupy.tile(self.cls_reg_tokens, (self.batch_size, 1, 1))
-        self.embeddings = cupy.concatenate([class_token_batch, self.embeddings], axis = 1)
+        if self.cls_reg_size:
+            cls_reg_batch = xp.broadcast_to(self.cls_reg_tokens,
+                                             (self.batch_size,
+                                              self.cls_reg_size,
+                                              self.embedding_dim))
 
-        self.output = self.embeddings + self.positional_embeddings
+            self.output = xp.concatenate([cls_reg_batch, self.embeddings], axis = 1)
+
+        else:
+            self.output = self.embeddings
+
+        self.output += self.positional_encodings
+
         return self.output
 
     def backward(self, gradient):
+
+        self.positional_encoding_grads += gradient.sum(axis = 0)
+
+        if self.num_registers:
+            # These positional rows are padding, not trainable register positions.
+            register_start = self.cls_size
+            register_end   = self.cls_size + self.num_registers
+
+            self.positional_encoding_grads[register_start:register_end] = 0
+
+        if self.cls_reg_size:
+            self.cls_reg_token_grads += gradient[:, :self.cls_reg_size].sum(axis = 0)
+            gradient = gradient[:, self.cls_reg_size:]
+
         
-        self.positional_embeddings_grads += gradient.sum(axis = 0)
+        self.projection_grads += xp.einsum("bnc,bnd->cd", self.tokens, gradient)
+        self.projection_bias_grads += gradient.sum(axis = (0,1))
 
-        self.cls_reg_token_grads += gradient[:,:self.cls_reg_size,:].sum(axis = 0)
-        gradient = gradient[:,self.cls_reg_size:,:]
-
-        self.projection_grads += cupy.tensordot(self.tokens.transpose(2, 0, 1), gradient, 2) / gradient.shape[1]
-        gradient = gradient @ self.projection.transpose()
+        gradient = gradient @ self.projection_weights.T
 
         gradient = gradient.reshape((self.batch_size,
-                                     self.patches_height,  self.patches_width,
+                                     self.patches_height, self.patches_width,
                                      self.patch_size[0], self.patch_size[1], self.channels))
 
-        gradient = gradient.transpose(0, 5, 1, 3, 2, 4)
+        gradient = gradient.transpose(0,5,1,3,2,4)
         gradient = gradient.reshape((self.batch_size, self.channels, self.height, self.width))
+
         return gradient
 
 class VitMLPHead(Layer):
@@ -101,16 +135,34 @@ class VitMLPHead(Layer):
     def backward(self, gradient):
 
         self.weight_grads += self.class_tokens.transpose() @ gradient
-        self.bias_grads += cupy.sum(gradient, axis = 0)
+        self.bias_grads += xp.sum(gradient, axis = 0)
 
         gradient = gradient @ self.weights.transpose()
-        gradient = gradient[:,cupy.newaxis,:]
+        gradient = gradient[:,xp.newaxis,:]
 
-        return cupy.concatenate((gradient, init_zeros_tensor(self.input.shape)[:,:-1,:]), axis = 1)
+        return xp.concatenate((gradient, init_zeros_tensor(self.input.shape)[:,:-1,:]), axis = 1)
+
+class GPTEmbeddingTable(Layer):
+
+    """One weight and optimizer state shared by a front/back embedding pair.
+
+    The front exposes the state to Network; the back only accumulates into it.
+    Existing arrays are wrapped without copying. Construction honors inference_mode
+    and empty_weights through the same helpers as other layers.
+    """
+
+    def __init__(self, vocab_size, embed_size, table = None, scale = 1.0):
+        super(GPTEmbeddingTable, self).__init__()
+        if table is not None and table.shape != (vocab_size, embed_size):
+            raise ValueError("embedding table shape must match vocab_size and embed_size")
+        self.table = (init_weight_tensor((vocab_size, embed_size), scale)
+                      if table is None else table)
+        self.table_grads = self.register(self.table)
+
 
 class GPTEmbedFront(Layer):
 
-    """Token embedding lookup, with optional absolute sinusoidal positions.
+    """Token embedding lookup, with sinusoidal, learned, or no absolute positions.
 
     positional = "none" is what a RoPE model wants: position enters inside attention
     instead, so nothing is added here.
@@ -119,26 +171,41 @@ class GPTEmbedFront(Layer):
     put the embedding scale on the same footing as the residual stream.
     """
 
-    def __init__(self, table, context_length, positional = "sinusoidal", scale_embeddings = False):
+    def __init__(self, table: GPTEmbeddingTable, context_length, positional = "sinusoidal", scale_embeddings = False):
         super(GPTEmbedFront, self).__init__()
 
-        assert positional in {"sinusoidal", "none"}
+        assert positional in {"sinusoidal", "learned", "none"}
 
-        self.table         = table
+        if not isinstance(table, GPTEmbeddingTable):
+            raise TypeError("GPTEmbedFront requires a GPTEmbeddingTable")
+        if table.inference_only != self.inference_only:
+            raise ValueError("shared embedding table and layer must use the same inference mode")
+        
+        self.embedding_table = table
+        self.table = table.table
+        self.table_grads = table.table_grads
+        
+        # Register embedding table once here
+        self.parameters = list(table.parameters)
+        self.gradients = list(table.gradients)
+        self.moments = list(table.moments)
+        self.variances = list(table.variances)
 
-        self.scale = table.shape[1]**0.5 if scale_embeddings else 1.0
+        self.scale = self.table.shape[1]**0.5 if scale_embeddings else 1.0
 
         self.positional_encoding = None
+        self.positional_encoding_grads = None
         if positional == "sinusoidal":
-            pos = cupy.arange(context_length)[:, None]
-            i   = cupy.arange(table.shape[1])[None, :]
+            pos = xp.arange(context_length)[:, None]
+            i   = xp.arange(self.table.shape[1])[None, :]
 
-            self.positional_encoding = pos / 10000**(2 * (i // 2) / table.shape[1])
-            self.positional_encoding[:, 0::2] = cupy.sin(self.positional_encoding[:, 0::2])
-            self.positional_encoding[:, 1::2] = cupy.cos(self.positional_encoding[:, 1::2])
+            self.positional_encoding = pos / 10000**(2 * (i // 2) / self.table.shape[1])
+            self.positional_encoding[:, 0::2] = xp.sin(self.positional_encoding[:, 0::2])
+            self.positional_encoding[:, 1::2] = xp.cos(self.positional_encoding[:, 1::2])
             self.positional_encoding = self.positional_encoding.astype(FLOAT_TYPE, copy = False)
-
-        self.table_grads = self.register(self.table)
+        elif positional == "learned":
+            self.positional_encoding = init_zeros_tensor((context_length, self.table.shape[1]))
+            self.positional_encoding_grads = self.register(self.positional_encoding)
 
     def forward(self, input):
         self.input  = input
@@ -150,7 +217,10 @@ class GPTEmbedFront(Layer):
 
         if self.scale != 1.0:
             self.output = self.output * self.scale
+            
         if self.positional_encoding is not None:
+            if position + self.input.shape[1] > self.positional_encoding.shape[0]:
+                raise ValueError("input exceeds the absolute position table's context length")
             self.output = self.output + self.positional_encoding[position : position + self.input.shape[1],:]
 
         if self.cache is not None:
@@ -159,7 +229,15 @@ class GPTEmbedFront(Layer):
         return self.output
 
     def backward(self, gradient):
-        scatter_add(self.table_grads, self.input, gradient * (self.scale / gradient.shape[1]))
+        
+        if self.cache is not None:
+            raise RuntimeError("backward() while an embedding cache is active is unsupported")
+        
+        xp.add.at(self.table_grads, self.input, gradient * self.scale)
+        
+        if self.positional_encoding_grads is not None:
+            self.positional_encoding_grads[:self.input.shape[1]] += gradient.sum(axis=0)
+            
         return None # nothing upstream of the token ids to receive a gradient
 
 
@@ -175,11 +253,17 @@ class GPTEmbedBack(Layer):
     the most expensive mistake available here.
     """
 
-    def __init__(self, table):
+    def __init__(self, table: GPTEmbeddingTable):
         super(GPTEmbedBack, self).__init__()
 
-        self.table         = table
-        self.table_grads = self.register(self.table)
+        if not isinstance(table, GPTEmbeddingTable):
+            raise TypeError("GPTEmbedBack requires a GPTEmbeddingTable")
+        if table.inference_only != self.inference_only:
+            raise ValueError("shared embedding table and layer must use the same inference mode")
+        self.embedding_table = table
+        self.table = table.table
+        self.table_grads = table.table_grads
+        # The front owns registration, zeroing, and optimizer updates.
 
     def forward(self, input):
         if self.cache is not None:
@@ -189,5 +273,5 @@ class GPTEmbedBack(Layer):
         return self.output
 
     def backward(self, gradient):
-        self.table_grads += cupy.tensordot(self.input.transpose(2, 0, 1), gradient, 2).transpose() / gradient.shape[1]
+        self.table_grads += xp.tensordot(self.input.transpose(2, 0, 1), gradient, 2).transpose()
         return gradient @ self.table
