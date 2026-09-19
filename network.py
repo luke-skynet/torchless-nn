@@ -1,9 +1,9 @@
-import cupy
+from backend import xp, FLOAT_TYPE
 
 import numpy as np
 from tqdm import tqdm
 
-from utils import Layer, FLOAT_TYPE
+from utils import Layer
 from layers import *
 from transformer_adapters import *
 
@@ -11,7 +11,7 @@ from transformer_adapters import *
 class CrossEntropy:
 
     def __init__(self, num_classes):
-        self.one_hot = cupy.eye(num_classes, dtype = FLOAT_TYPE)
+        self.one_hot = xp.eye(num_classes, dtype = FLOAT_TYPE)
 
     def gradients(self, logits, labels):
         return logits - self.one_hot[labels] # Combined Softmax + Cross Entropy Loss
@@ -19,7 +19,7 @@ class CrossEntropy:
     def loss(self, logits, labels):
         labels = self.one_hot[labels]
         eta = 1e-7
-        return -1 * cupy.sum(labels * cupy.log(logits + eta))
+        return -1 * xp.sum(labels * xp.log(logits + eta))
     
     def num_samples(self, labels):
         return labels.size
@@ -114,8 +114,8 @@ class Network:
                 if augments is not None:
                     x = augments(x)
 
-                x = cupy.array(x)
-                y = cupy.array(y)
+                x = xp.array(x)
+                y = xp.array(y)
                 
                 y_hat = self._forward(x)
                 
@@ -132,7 +132,7 @@ class Network:
                     samples_in_step = 0
 
                 train_loss += criterion.loss(y_hat, y)
-                train_correct += cupy.equal(cupy.argmax(y_hat, axis = -1), y).astype(cupy.int32).sum()
+                train_correct += xp.equal(xp.argmax(y_hat, axis = -1), y).astype(xp.int32).sum()
                 
             train_loss     = train_loss    / np.prod(train_labels.shape)
             train_accuracy = train_correct / np.prod(train_labels.shape)
@@ -149,12 +149,12 @@ class Network:
 
         for i in tqdm(range(0, len(test_data), batch_size)):
 
-            x = cupy.array(test_data  [i: min(i + batch_size, len(test_data))])
-            y = cupy.array(test_labels[i: min(i + batch_size, len(test_data))])
+            x = xp.array(test_data  [i: min(i + batch_size, len(test_data))])
+            y = xp.array(test_labels[i: min(i + batch_size, len(test_data))])
 
             y_hat = self.predict(x)
 
             loss += criterion.loss(y_hat, y)
-            correct += cupy.equal(cupy.argmax(y_hat, axis = -1), y).astype(cupy.int32).sum()
+            correct += xp.equal(xp.argmax(y_hat, axis = -1), y).astype(xp.int32).sum()
 
         return loss / np.prod(test_labels.shape), correct / np.prod(test_labels.shape)

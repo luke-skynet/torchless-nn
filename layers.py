@@ -1,6 +1,6 @@
-import cupy
+from backend import xp, FLOAT_TYPE, init_random_tensor, init_zeros_tensor
+from utils import Layer
 
-from utils import Layer, FLOAT_TYPE, init_random_tensor, init_zeros_tensor
 
 class Convolution(Layer):
 
@@ -26,29 +26,29 @@ class Convolution(Layer):
 
         self.input = input
         
-        self.padded_input = cupy.pad(self.input, ((0, 0), (0, 0), (self.pad_h, self.pad_h), (self.pad_w, self.pad_w)))
+        self.padded_input = xp.pad(self.input, ((0, 0), (0, 0), (self.pad_h, self.pad_h), (self.pad_w, self.pad_w)))
 
-        self.output = cupy.lib.stride_tricks.sliding_window_view(self.padded_input, self.kernel_size, (2, 3))
-        self.output = cupy.einsum("nchwkl,ockl->nohw", self.output, self.weights)
+        self.output = xp.lib.stride_tricks.sliding_window_view(self.padded_input, self.kernel_size, (2, 3))
+        self.output = xp.einsum("nchwkl,ockl->nohw", self.output, self.weights)
         self.output = self.output + self.bias
 
         return self.output
 
     def backward(self, gradient):
 
-        conv_in = cupy.lib.stride_tricks.sliding_window_view(self.padded_input, self.output_dims, (2, 3))
-        self.weight_grads += cupy.einsum("ncklhw,nohw->ockl", conv_in, gradient)
+        conv_in = xp.lib.stride_tricks.sliding_window_view(self.padded_input, self.output_dims, (2, 3))
+        self.weight_grads += xp.einsum("ncklhw,nohw->ockl", conv_in, gradient)
 
-        self.bias_grads += cupy.sum(gradient, axis = (0, 2, 3), keepdims = True)
+        self.bias_grads += xp.sum(gradient, axis = (0, 2, 3), keepdims = True)
 
         grad_pad_h = self.kernel_size[0] - 1
         grad_pad_w = self.kernel_size[1] - 1
 
-        flipped_weights = cupy.flip(self.weights, axis=(2, 3))
+        flipped_weights = xp.flip(self.weights, axis=(2, 3))
 
-        gradient = cupy.pad(gradient, ((0, 0), (0, 0), (grad_pad_h, grad_pad_h), (grad_pad_w, grad_pad_w)))
-        gradient = cupy.lib.stride_tricks.sliding_window_view(gradient, self.kernel_size, (2, 3))
-        gradient = cupy.einsum("nohwkl,ockl->nchw", gradient, flipped_weights)
+        gradient = xp.pad(gradient, ((0, 0), (0, 0), (grad_pad_h, grad_pad_h), (grad_pad_w, grad_pad_w)))
+        gradient = xp.lib.stride_tricks.sliding_window_view(gradient, self.kernel_size, (2, 3))
+        gradient = xp.einsum("nohwkl,ockl->nchw", gradient, flipped_weights)
         gradient = gradient[:, :, self.pad_h:gradient.shape[2]-self.pad_h, self.pad_w:gradient.shape[3]-self.pad_w]
         
         return gradient
@@ -83,8 +83,8 @@ class BatchNorm(Layer):
         self.input = input
         
         if self.eval_mode is False:
-            self.mean = cupy.mean(input, axis = (0, 2, 3), keepdims = True)
-            self.var  = cupy.var(input, axis = (0, 2, 3), keepdims = True)
+            self.mean = xp.mean(input, axis = (0, 2, 3), keepdims = True)
+            self.var  = xp.var(input, axis = (0, 2, 3), keepdims = True)
             self.running_mean = (1 - self.momentum) * self.running_mean + self.momentum * self.mean
             self.running_var  = (1 - self.momentum) * self.running_var  + self.momentum * self.var
         else:
@@ -101,14 +101,14 @@ class BatchNorm(Layer):
             
     def backward(self, gradient):
         
-        self.gamma_grads += cupy.sum(gradient * self.normed, axis = (0, 2, 3), keepdims = True)
-        self.beta_grads  += cupy.sum(gradient,               axis = (0, 2, 3), keepdims = True)
+        self.gamma_grads += xp.sum(gradient * self.normed, axis = (0, 2, 3), keepdims = True)
+        self.beta_grads  += xp.sum(gradient,               axis = (0, 2, 3), keepdims = True)
         
         gradient = gradient * self.gamma
         
-        gradient_normed = (gradient - cupy.mean(gradient, axis = (0, 2, 3), keepdims = True)) / self.std
+        gradient_normed = (gradient - xp.mean(gradient, axis = (0, 2, 3), keepdims = True)) / self.std
         
-        return gradient_normed - self.centered * (cupy.mean(gradient * self.centered, axis = (0, 2, 3), keepdims = True) / self.std**3)
+        return gradient_normed - self.centered * (xp.mean(gradient * self.centered, axis = (0, 2, 3), keepdims = True) / self.std**3)
     
 
 class MaxPool(Layer):
@@ -139,7 +139,7 @@ class MaxPool(Layer):
         return self.output
 
     def backward(self, gradient):
-        gradient = gradient[:, :, :, cupy.newaxis, :, cupy.newaxis]
+        gradient = gradient[:, :, :, xp.newaxis, :, xp.newaxis]
         gradient = gradient * self.mask
         gradient = gradient.reshape(self.batch_size, self.channels, self.in_h, self.in_w)
         return gradient
@@ -167,12 +167,12 @@ class AveragePool(Layer):
         
         self.output = view.mean(axis=(3, 5), keepdims = True)
 
-        self.mask   = cupy.ones(view.shape, dtype = FLOAT_TYPE) / (self.pool_h * self.pool_w)
+        self.mask   = xp.ones(view.shape, dtype = FLOAT_TYPE) / (self.pool_h * self.pool_w)
         self.output = self.output.reshape(self.batch_size, self.channels, out_h, out_w)
         return self.output
 
     def backward(self, gradient):
-        gradient = gradient[:, :, :, cupy.newaxis, :, cupy.newaxis]
+        gradient = gradient[:, :, :, xp.newaxis, :, xp.newaxis]
         gradient = gradient * self.mask
         gradient = gradient.reshape(self.batch_size, self.channels, self.in_h, self.in_w)
         return gradient
@@ -210,7 +210,7 @@ class Dense(Layer):
 
     def backward(self, gradient):
         self.weight_grads += self.input.transpose() @ gradient
-        self.bias_grads   += cupy.sum(gradient, axis = 0)
+        self.bias_grads   += xp.sum(gradient, axis = 0)
         return gradient @ self.weights.transpose()
 
 
@@ -219,7 +219,7 @@ class Dropout(Layer):
         super(Dropout, self).__init__()
         
         self.dropout_rate = dropout_rate
-        self.dropout_rng  = cupy.random.default_rng()
+        self.dropout_rng  = xp.random.default_rng()
         self.dropout_neurons = None
     
     def forward(self, input):
@@ -252,8 +252,8 @@ class MultiHeadAttention(Layer):
 
         self.is_decoder = decoder
         if self.is_decoder:
-            self.mask = cupy.tril(cupy.ones((context_length, context_length)))
-            self.mask = cupy.where(self.mask == 0, -1e9, 0.0).astype(FLOAT_TYPE, copy = False)
+            self.mask = xp.tril(xp.ones((context_length, context_length)))
+            self.mask = xp.where(self.mask == 0, -1e9, 0.0).astype(FLOAT_TYPE, copy = False)
 
         self.query = None
         self.key_t = None
@@ -284,7 +284,7 @@ class MultiHeadAttention(Layer):
         B, T, C    = self.input.shape
 
         qkv = self.input @ self.qkv_weights + self.qkv_bias
-        self.query, self.key_t, self.value = cupy.split(qkv, 3, axis = 2)
+        self.query, self.key_t, self.value = xp.split(qkv, 3, axis = 2)
 
         self.query = self.query.reshape((B, T, self.num_heads, self.heads_dim)).transpose(0, 2, 1, 3)
         self.key_t = self.key_t.reshape((B, T, self.num_heads, self.heads_dim)).transpose(0, 2, 3, 1)
@@ -295,9 +295,9 @@ class MultiHeadAttention(Layer):
         if self.is_decoder:
             attends += self.mask[:T,:T]
 
-        normalization = cupy.max(attends, axis = -1, keepdims = True)
-        exponent      = cupy.exp(attends - normalization)
-        self.softmax  = exponent / cupy.sum(exponent, axis = -1, keepdims=True)
+        normalization = xp.max(attends, axis = -1, keepdims = True)
+        exponent      = xp.exp(attends - normalization)
+        self.softmax  = exponent / xp.sum(exponent, axis = -1, keepdims=True)
         self.dropped_softmax = self.attn_dropout.forward(self.softmax)
 
         self.heads_out = self.dropped_softmax @ self.value
@@ -311,8 +311,8 @@ class MultiHeadAttention(Layer):
         B, T, C = gradient.shape
         gradient = self.res_dropout.backward(gradient)
         
-        self.out_weight_grads += cupy.tensordot(self.heads_out.transpose(2, 0, 1), gradient, 2)
-        self.out_bias_grads   += cupy.sum(gradient, axis = (0, 1))
+        self.out_weight_grads += xp.tensordot(self.heads_out.transpose(2, 0, 1), gradient, 2)
+        self.out_bias_grads   += xp.sum(gradient, axis = (0, 1))
         
         gradient = gradient @ self.out_weights.transpose()
         gradient = gradient.reshape((B, T, self.num_heads, self.heads_dim)).transpose(0, 2, 1, 3)
@@ -331,10 +331,10 @@ class MultiHeadAttention(Layer):
         key_t_grads = key_t_grads.transpose(0, 3, 1, 2).reshape(B, T, C)
         value_grads = value_grads.transpose(0, 2, 1, 3).reshape(B, T, C)
 
-        gradient = cupy.concatenate((query_grads, key_t_grads, value_grads), axis = 2)
+        gradient = xp.concatenate((query_grads, key_t_grads, value_grads), axis = 2)
 
-        self.qkv_weight_grads += cupy.tensordot(self.input.transpose(2, 0, 1), gradient, 2)
-        self.qkv_bias_grads   += cupy.sum(gradient, axis = (0, 1))
+        self.qkv_weight_grads += xp.tensordot(self.input.transpose(2, 0, 1), gradient, 2)
+        self.qkv_bias_grads   += xp.sum(gradient, axis = (0, 1))
         
         return gradient @ self.qkv_weights.transpose()
 
@@ -379,12 +379,12 @@ class TransformerFeedForward(Layer):
         B, T, C = gradient.shape
         
         gradient = self.dropout.backward(gradient)
-        self.weight_grads2 += cupy.tensordot(self.hidden_output.transpose(2, 0, 1), gradient, 2)
-        self.bias_grads2   += cupy.sum(gradient, axis = (0, 1))
+        self.weight_grads2 += xp.tensordot(self.hidden_output.transpose(2, 0, 1), gradient, 2)
+        self.bias_grads2   += xp.sum(gradient, axis = (0, 1))
         
         gradient = self.activation.backward(gradient @ self.weights2.transpose())
-        self.weight_grads1 += cupy.tensordot(self.input.transpose(2, 0, 1), gradient,  2)
-        self.bias_grads1   += cupy.sum(gradient, axis = (0, 1))
+        self.weight_grads1 += xp.tensordot(self.input.transpose(2, 0, 1), gradient,  2)
+        self.bias_grads1   += xp.sum(gradient, axis = (0, 1))
 
         return gradient @ self.weights1.transpose()
 
@@ -416,8 +416,8 @@ class LayerNorm(Layer):
 
         self.input = input
 
-        self.mean = cupy.mean(input, axis=-1, keepdims=True)
-        self.var  = cupy.var(input, axis=-1, keepdims=True)
+        self.mean = xp.mean(input, axis=-1, keepdims=True)
+        self.var  = xp.var(input, axis=-1, keepdims=True)
 
         self.centered = input - self.mean
 
@@ -431,14 +431,14 @@ class LayerNorm(Layer):
         
         B, T, C = gradient.shape
 
-        self.gamma_grads += cupy.sum(gradient * self.normed, axis=(0, 1))
-        self.beta_grads  += cupy.sum(gradient, axis=(0, 1))
+        self.gamma_grads += xp.sum(gradient * self.normed, axis=(0, 1))
+        self.beta_grads  += xp.sum(gradient, axis=(0, 1))
 
         gradient = gradient * self.gamma
         
-        gradient_normed = (gradient - cupy.mean(gradient, axis = -1, keepdims = True)) / self.std
+        gradient_normed = (gradient - xp.mean(gradient, axis = -1, keepdims = True)) / self.std
         
-        return gradient_normed - self.centered * (cupy.mean(gradient * self.centered, axis = -1, keepdims = True) / self.std**3)
+        return gradient_normed - self.centered * (xp.mean(gradient * self.centered, axis = -1, keepdims = True) / self.std**3)
 
 
 class TransformerBlock(Layer):

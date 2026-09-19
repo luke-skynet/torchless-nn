@@ -1,20 +1,7 @@
-import cupy
+from backend import xp, FLOAT_TYPE, init_random_tensor, init_zeros_tensor
+
 import numpy as np
 import cv2
-
-global FLOAT_TYPE 
-FLOAT_TYPE = cupy.float32 # (TF32 enabled)
-
-
-# tensor initialization with float type
-
-def init_random_tensor(size):
-    rng = cupy.random.default_rng()
-    return rng.standard_normal(size, dtype = FLOAT_TYPE)
-
-def init_zeros_tensor(size):
-    return cupy.zeros(size, dtype = FLOAT_TYPE)
-
 
 # layer interface and residual layer wrapper
 
@@ -97,12 +84,12 @@ class Residual(Layer):
         if self.mode == "add":
             self.output = self.input + x
         elif self.mode == "concat":
-            self.output = cupy.concatenate((self.input, x), axis = self.concat_axis)
+            self.output = xp.concatenate((self.input, x), axis = self.concat_axis)
         return self.output
     
     def backward(self, gradient):
         
-        gradient, nabla = (gradient, gradient) if self.mode == "add" else cupy.array_split(gradient, 
+        gradient, nabla = (gradient, gradient) if self.mode == "add" else xp.array_split(gradient, 
                                                                                            (self.input.shape[self.concat_axis], ),
                                                                                            axis = self.concat_axis)
         

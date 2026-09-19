@@ -1,7 +1,6 @@
-import cupy
-import cupyx
+from backend import xp, FLOAT_TYPE, init_random_tensor, init_zeros_tensor
 
-from utils import Layer, FLOAT_TYPE, init_random_tensor, init_zeros_tensor
+from utils import Layer
 from layers import Dropout
 
 class VitProjector(Layer):
@@ -49,8 +48,8 @@ class VitProjector(Layer):
 
         self.embeddings = self.tokens @ self.projection
 
-        class_token_batch = cupy.tile(self.cls_reg_tokens, (self.batch_size, 1, 1))
-        self.embeddings = cupy.concatenate([class_token_batch, self.embeddings], axis = 1)
+        class_token_batch = xp.tile(self.cls_reg_tokens, (self.batch_size, 1, 1))
+        self.embeddings = xp.concatenate([class_token_batch, self.embeddings], axis = 1)
 
         self.output = self.embeddings + self.positional_embeddings
         return self.output
@@ -62,7 +61,7 @@ class VitProjector(Layer):
         self.cls_reg_token_grads += gradient[:,:self.cls_reg_size,:].sum(axis = 0)
         gradient = gradient[:,self.cls_reg_size:,:]
 
-        self.projection_grads += cupy.tensordot(self.tokens.transpose(2, 0, 1), gradient, 2)
+        self.projection_grads += xp.tensordot(self.tokens.transpose(2, 0, 1), gradient, 2)
         gradient = gradient @ self.projection.transpose()
 
         gradient = gradient.reshape((self.batch_size,
@@ -98,12 +97,12 @@ class VitMLPHead(Layer):
     def backward(self, gradient):
 
         self.weight_grads += self.class_tokens.transpose() @ gradient
-        self.bias_grads += cupy.sum(gradient, axis = 0)
+        self.bias_grads += xp.sum(gradient, axis = 0)
 
         gradient = gradient @ self.weights.transpose()
-        gradient = gradient[:,cupy.newaxis,:]
+        gradient = gradient[:,xp.newaxis,:]
 
-        return cupy.concatenate((gradient, init_zeros_tensor(self.input.shape)[:,:-1,:]), axis = 1)
+        return xp.concatenate((gradient, init_zeros_tensor(self.input.shape)[:,:-1,:]), axis = 1)
 
 
 class GPTEmbeddingTable:
@@ -127,12 +126,12 @@ class GPTEmbedFront(Layer):
         self.pos_embedding_table = None
 
         if self.positional_embedding == "sinusoidal":
-            pos = cupy.arange(context_length)[:, None]
-            i   = cupy.arange(embedding_table.embed_size)[None, :]
+            pos = xp.arange(context_length)[:, None]
+            i   = xp.arange(embedding_table.embed_size)[None, :]
 
             self.pos_embedding_table = pos / 10000**(2 * (i // 2) / embedding_table.embed_size)
-            self.pos_embedding_table[:, 0::2] = cupy.sin(self.pos_embedding_table[:, 0::2])
-            self.pos_embedding_table[:, 1::2] = cupy.cos(self.pos_embedding_table[:, 1::2])
+            self.pos_embedding_table[:, 0::2] = xp.sin(self.pos_embedding_table[:, 0::2])
+            self.pos_embedding_table[:, 1::2] = xp.cos(self.pos_embedding_table[:, 1::2])
             self.pos_embedding_table = self.pos_embedding_table.astype(FLOAT_TYPE, copy = False)
         else:
             self.pos_embedding_table = init_zeros_tensor((context_length, embedding_table.embed_size))
@@ -157,7 +156,7 @@ class GPTEmbedFront(Layer):
         
         B, T, C = gradient.shape
         
-        cupy.add.at(self.embedding_table.table_grads, self.input, gradient)
+        xp.add.at(self.embedding_table.table_grads, self.input, gradient)
         
         if self.positional_embedding == "learned":
             self.pos_embedding_table_grads[:T] += gradient.sum(axis = 0)
@@ -178,5 +177,5 @@ class GPTEmbedBack(Layer):
         return self.output
 
     def backward(self, gradient):
-        self.embedding_table.table_grads += cupy.tensordot(self.input.transpose(2, 0, 1), gradient, 2).transpose()
+        self.embedding_table.table_grads += xp.tensordot(self.input.transpose(2, 0, 1), gradient, 2).transpose()
         return gradient @ self.embedding_table.table
