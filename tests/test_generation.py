@@ -139,7 +139,7 @@ def test_numpy_generation_cli(reference, tokenizer, tmp_path):
          '--prompt', 'hello world', '--context-length', '32', '--max-new-tokens', '3',
          '--prefill-step', '3', '--chunk-size', '2', '--report', str(report_path)],
         cwd=Path(__file__).resolve().parents[1],
-        env={**os.environ, 'TORCHLESS_BACKEND': 'cupy'},
+        env={**os.environ, 'XP_RUNTIME': 'CUDA'},
         capture_output=True, text=True, check=True)
     ids = encode_prompt(tokenizer, 'hello world')
     with torch.no_grad():

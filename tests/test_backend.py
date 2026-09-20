@@ -26,4 +26,4 @@ layer.backward(xp.array([[[3, 6], [9, 12], [15, 18]]], dtype=xp.float32))
 np.testing.assert_array_equal(to_numpy(layer.table_grads), [[0, 0], [12, 18], [15, 18]])
 assert 'cupy' not in sys.modules
 '''], cwd=Path(__file__).resolve().parents[1],
-                   env={**os.environ, 'TORCHLESS_BACKEND': 'numpy'}, check=True)
+                   env={**os.environ, 'XP_RUNTIME': 'CPU'}, check=True)

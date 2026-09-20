@@ -1,10 +1,10 @@
 """Finite differences with fixed dropout masks exercise both FFN branches."""
 import numpy as np
 import pytest
+import backend
 from backend import xp
 
 import layers
-import utils
 from activations import SiLU
 from layers import GatedFeedForward, TransformerFeedForward, TransformerBlock
 
@@ -31,7 +31,7 @@ def numerical_gradient(loss, tensor):
 @pytest.mark.parametrize('in_block', [False, True])
 @pytest.mark.parametrize('bias', [False, True])
 def test_gradients(monkeypatch, glu, rates, in_block, bias):
-    monkeypatch.setattr(utils, 'FLOAT_TYPE', xp.float64)
+    monkeypatch.setattr(backend, 'FLOAT_TYPE', xp.float64)
     monkeypatch.setattr(layers, 'FLOAT_TYPE', xp.float64)
     kwargs = dict(glu=glu, hidden_dropout_rate=rates[0], output_dropout_rate=rates[1])
     layer = (TransformerBlock(4, 3, 2, SiLU, ffn_multiplier=2, attn_bias=bias, ffn_bias=bias,
@@ -66,7 +66,7 @@ def test_gradients(monkeypatch, glu, rates, in_block, bias):
 @pytest.mark.parametrize('glu', [False, True])
 def test_eval_cache_and_inference(glu):
     assert GatedFeedForward is TransformerFeedForward
-    with utils.inference_mode():
+    with backend.inference_mode():
         block = TransformerBlock(4, 3, 2, SiLU, glu=glu,
                                  hidden_dropout_rate=.25, output_dropout_rate=.4)
     ffn = block.ffn

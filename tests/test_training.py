@@ -7,14 +7,14 @@ from activations import GeLUTanh, SoftMax
 from layers import LayerNorm, TransformerBlock
 from network import CrossEntropy, Network
 from transformer_adapters import GPTEmbeddingTable, GPTEmbedFront, GPTEmbedBack, VitMLPHead, VitProjector
-import utils
+import backend
 
 
 @pytest.mark.parametrize('task', ['vision', 'tokens'])
 @pytest.mark.parametrize('batch_size,batches_per_step', [(2, 2), (2, 4), (4, 1)])
 @pytest.mark.parametrize('adam_eps', [1e-7, .05])
 def test_accumulation_matches_full_batch(monkeypatch, task, batch_size, batches_per_step, adam_eps):
-    monkeypatch.setattr(utils, 'FLOAT_TYPE', xp.float64)
+    monkeypatch.setattr(backend, 'FLOAT_TYPE', xp.float64)
     # Keep the grouping identical between training and the explicit reference steps.
     monkeypatch.setattr(np.random, 'permutation', lambda n: np.arange(n))
     rng = np.random.default_rng(27)

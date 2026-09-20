@@ -6,8 +6,8 @@ from backend import xp, to_numpy
 from gemma import gemma_gpt, gemma_parameter_count
 from network import CrossEntropy
 from transformer_adapters import GPTEmbeddingTable, GPTEmbedFront, GPTEmbedBack
-from utils import inference_mode, empty_weights
-import utils
+from backend import inference_mode, empty_weights
+import backend
 import layers
 
 
@@ -29,7 +29,7 @@ def test_embedding_layers_reject_raw_arrays(layer_type):
 
 @pytest.mark.parametrize('supplied', ['none', 'array', 'shared'])
 def test_gemma_shared_gradient_and_single_adam_update(monkeypatch, supplied):
-    monkeypatch.setattr(utils, 'FLOAT_TYPE', xp.float64)
+    monkeypatch.setattr(backend, 'FLOAT_TYPE', xp.float64)
     monkeypatch.setattr(layers, 'FLOAT_TYPE', xp.float64)
     rng = np.random.default_rng(12)
     original = xp.asarray(rng.normal(scale=.2, size=(7, 8)))
@@ -91,7 +91,7 @@ def test_gemma_shared_gradient_and_single_adam_update(monkeypatch, supplied):
 def test_empty_inference_embedding_has_no_training_state(monkeypatch):
     def unexpected_rng(*args, **kwargs):
         raise AssertionError('empty_weights must not initialize random weights')
-    monkeypatch.setattr(utils, 'init_random_tensor', unexpected_rng)
+    monkeypatch.setattr(backend, 'init_random_tensor', unexpected_rng)
     with inference_mode(), empty_weights():
         model = gemma_gpt(**CONFIG)
     front, back = embedding_pair(model)

@@ -3,8 +3,8 @@
 Convolutional Neural Nets, Vision Transformers, and GPT's all implemented from scratch in Cuda Numpy (CuPy).
 Without torch's tensor or autograd engine, this library hand derives all gradient calculations with reverse accumulation.
 All model operations use the shared `xp` backend in `backend.py`. CuPy is the default.
-To use NumPy on CPU, set `TORCHLESS_BACKEND=numpy` before importing any library modules
-(or set `os.environ['TORCHLESS_BACKEND'] = 'numpy'` at the start of a notebook).
+To use NumPy on CPU, set `XP_RUNTIME=CPU` before importing any library modules
+(or set `os.environ['XP_RUNTIME'] = 'CPU'` at the start of a notebook).
 Use `from backend import xp` when creating input arrays. Select one backend per process.
 NumPy execution does not require CuPy; for CPU-only runtime installation, omit the
 `cupy-cuda12x` line from `requirements.txt`.
@@ -106,7 +106,7 @@ denominator on every update, including the final partial accumulation group.
 ## Inference Mode
 
 ```python
-from utils import inference_mode
+from backend import inference_mode
 
 with inference_mode():
     model = gemma_gpt(**config)
@@ -123,7 +123,8 @@ Layers built inside the context allocate no gradient, moment or variance buffers
 * **optimizer.py** - Fused CUDA AdamW updates and the NumPy reference implementation.
 * **transformer_adapters.py** - ViT image to tokens embedding, ViT MLP classification head, GPT embedding and GPT prediction layers.
 * **test_gemma.py** - Finite difference gradient checks for every layer, runnable on CPU (```python test_gemma.py```).
-* **utils** - Layer interface, Residual Layer wrapper, basic image augmentation functions, and tensor initializers to keep all parameters in FP32/TF32.
+* **backend.py** - Array backend selection (CuPy or NumPy), the FP32/TF32 float type, tensor initializers, and the `inference_mode` and `empty_weights` construction contexts.
+* **utils.py** - Layer interface, Residual Layer wrapper, the incremental decoding Cache, and basic image augmentation functions.
 
 ## Running Gemma 4 12B
 
@@ -162,7 +163,7 @@ context must cover the prompt plus requested generation; no silent truncation oc
 leave it off when comparing against FP32 reference results.
 
 For CPU generation, add `--backend numpy` to the generation command (or set
-`TORCHLESS_BACKEND=numpy`). CPU execution supports checkpoint loading and generation;
+`XP_RUNTIME=CPU`). CPU execution supports checkpoint loading and generation;
 `--tf32` requires CuPy. Reports use `peak_xp_used_bytes` and `peak_xp_reserved_bytes`
 for CUDA allocator peaks; both are `null` on CPU, where memory usage is not measured.
 

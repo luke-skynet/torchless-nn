@@ -334,7 +334,7 @@ class Checkpoint:
     def load_model(self, chunk_size=256):
         """Construct and load from this already-validated checkpoint manifest."""
         from gemma import gemma_gpt
-        from utils import inference_mode, empty_weights
+        from backend import inference_mode, empty_weights
 
         with inference_mode(), empty_weights():
             model = gemma_gpt(**self.config, chunk_size=chunk_size)

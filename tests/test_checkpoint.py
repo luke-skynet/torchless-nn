@@ -11,7 +11,7 @@ from transformers import Gemma4UnifiedTextConfig, Gemma4UnifiedForCausalLM
 from backend import xp
 from checkpoint import Checkpoint, load_checkpoint, model_config
 from gemma import gemma_gpt
-from utils import inference_mode, empty_weights
+from backend import inference_mode, empty_weights
 
 
 @pytest.mark.parametrize('declared', [False, True])
@@ -120,7 +120,7 @@ def test_reference_intermediates_and_cached_logits(reference, tmp_path, monkeypa
     reference.to(device)
     if device == 'cuda':
         torch.backends.cuda.matmul.allow_tf32 = False
-    with patch('utils.init_random_tensor', side_effect=AssertionError('checkpoint construction must not use RNG')):
+    with patch('backend.init_random_tensor', side_effect=AssertionError('checkpoint construction must not use RNG')):
         ours, report = load_checkpoint(tmp_path, context_length=32, chunk_size=2)
     assert ours.layers[0].table is ours.layers[-3].table
     assert len(report['skipped_tensors']) == (2 if multimodal else 0)

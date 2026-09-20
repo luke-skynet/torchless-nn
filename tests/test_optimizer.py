@@ -7,7 +7,7 @@ from network import Network
 from optimizer import Adam
 from transformer_adapters import VitProjector
 from utils import Layer
-import utils
+import backend
 
 
 def make_entry(shape, dtype, decay=True):
@@ -128,7 +128,7 @@ def test_empty_optimizer():
 
 @pytest.mark.parametrize('cls_token', [False, True])
 def test_network_decay_exclusions_and_frozen_positions(monkeypatch, cls_token):
-    monkeypatch.setattr(utils, 'FLOAT_TYPE', xp.float64)
+    monkeypatch.setattr(backend, 'FLOAT_TYPE', xp.float64)
     dense = Layer()
     for shape in [(2, 3), (3,)]:
         dense.register(xp.ones(shape, dtype=xp.float64))

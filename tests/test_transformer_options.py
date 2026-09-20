@@ -7,15 +7,15 @@ from activations import GeLUTanh, SoftMax
 from layers import MultiHeadAttention, TransformerBlock, LayerNorm
 from transformer_adapters import GPTEmbeddingTable, GPTEmbedFront, GPTEmbedBack
 from network import Network
-from utils import inference_mode, empty_weights
-import utils
+from backend import inference_mode, empty_weights
+import backend
 import layers
 from test_feedforward import numerical_gradient
 
 
 @pytest.fixture
 def fp64(monkeypatch):
-    monkeypatch.setattr(utils, 'FLOAT_TYPE', xp.float64)
+    monkeypatch.setattr(backend, 'FLOAT_TYPE', xp.float64)
     monkeypatch.setattr(layers, 'FLOAT_TYPE', xp.float64)
 
 
@@ -146,7 +146,7 @@ def test_learned_positions_cached_generation(fp64):
 def test_position_bounds_and_inference_allocation(monkeypatch):
     def no_rng(*args, **kwargs):
         raise AssertionError('empty_weights must not use random weight initialization')
-    monkeypatch.setattr(utils, 'init_random_tensor', no_rng)
+    monkeypatch.setattr(backend, 'init_random_tensor', no_rng)
     with inference_mode(), empty_weights():
         model = learned_model()
     for layer in model.layers:

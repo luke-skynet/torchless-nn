@@ -1,6 +1,6 @@
-from backend import xp, FLOAT_TYPE
+from backend import xp, FLOAT_TYPE, init_random_tensor, init_zeros_tensor, init_weight_tensor
 
-from utils import Layer, init_random_tensor, init_zeros_tensor, init_weight_tensor
+from utils import Layer
 
 class Convolution(Layer):
 
@@ -178,11 +178,10 @@ class AveragePool(Layer):
         return self.output
 
     def backward(self, gradient):
-        # every input in a window contributed equally, so the gradient spreads evenly.
-        # This used to multiply by a full input sized array holding one constant, which
-        # also promoted the gradient to float64: xp.ones() has no dtype by default.
+        
         gradient = gradient[:, :, :, xp.newaxis, :, xp.newaxis] / (self.pool_h * self.pool_w)
         gradient = xp.broadcast_to(gradient, self.view_shape)
+        
         return gradient.reshape(self.batch_size, self.channels, self.in_h, self.in_w)
 
 class Flatten(Layer):

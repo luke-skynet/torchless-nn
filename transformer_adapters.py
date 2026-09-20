@@ -1,6 +1,6 @@
-from backend import xp, FLOAT_TYPE
+from backend import xp, FLOAT_TYPE, init_random_tensor, init_zeros_tensor, init_weight_tensor
 
-from utils import Layer, init_random_tensor, init_zeros_tensor, init_weight_tensor
+from utils import Layer
 
 class VitProjector(Layer):
 

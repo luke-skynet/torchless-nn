@@ -52,7 +52,7 @@ def parser():
     p.add_argument('--chunk-size', type=int, default=256)
     p.add_argument('--seed', type=int, default=0)
     p.add_argument('--backend', choices=('numpy', 'cupy'),
-                   default=os.environ.get('TORCHLESS_BACKEND', 'cupy'))
+                   default='numpy' if os.environ.get('XP_RUNTIME', 'CUDA') == 'CPU' else 'cupy')
     p.add_argument('--device', type=int, default=0)
     p.add_argument('--tf32', action='store_true', help='Enable TF32; default FP32 is preferable for parity checks')
     p.add_argument('--inspect', action='store_true', help='Validate config and shard headers without CUDA or loading weights')
@@ -85,7 +85,7 @@ def configure_backend(args):
     # Set TF32 before importing CuPy. --help and --inspect never need CUDA.
     if args.backend == 'numpy' and args.tf32:
         raise ValueError('--tf32 requires --backend cupy')
-    os.environ['TORCHLESS_BACKEND'] = args.backend
+    os.environ['XP_RUNTIME'] = 'CPU' if args.backend == 'numpy' else 'CUDA'
     os.environ['CUPY_TF32'] = '1' if args.tf32 else '0'
     from backend import xp
     if xp.__name__ != args.backend:

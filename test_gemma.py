@@ -13,7 +13,7 @@ analytic gradient against a finite difference of the forward pass.
 import os, sys, types
 import numpy as np
 
-os.environ['TORCHLESS_BACKEND'] = 'numpy'
+os.environ['XP_RUNTIME'] = 'CPU'
 if 'cv2' not in sys.modules: # only used by utils.augment_images, never called here
     sys.modules['cv2'] = types.ModuleType('cv2')
 
@@ -389,7 +389,7 @@ check_layer("AveragePool gradient", AveragePool(2, 2),
 
 print("\nsoftmax gradient:")
 from activations import SoftMax
-from utils import inference_mode, INFERENCE_MODE
+from backend import inference_mode, INFERENCE_MODE
 from network import Network
 
 logits = np.random.default_rng(3).standard_normal((2, 4, 6))
