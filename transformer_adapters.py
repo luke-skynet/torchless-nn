@@ -62,7 +62,7 @@ class VitProjector(Layer):
                                       self.sequence_length,
                                       self.token_dim)
 
-        self.embeddings = self.tokens @ self.projection_weights + self.projection_bias
+        self.embeddings = xp.tensordot(self.tokens, self.projection_weights, axes = 1) + self.projection_bias
 
         if self.cls_reg_size:
             cls_reg_batch = xp.broadcast_to(self.cls_reg_tokens,
@@ -95,10 +95,10 @@ class VitProjector(Layer):
             gradient = gradient[:, self.cls_reg_size:]
 
         
-        self.projection_grads += xp.einsum("bnc,bnd->cd", self.tokens, gradient)
+        self.projection_grads += xp.tensordot(self.tokens.transpose(2,0,1), gradient, 2)
         self.projection_bias_grads += gradient.sum(axis = (0,1))
 
-        gradient = gradient @ self.projection_weights.T
+        gradient = xp.tensordot(gradient, self.projection_weights.T, axes = 1)
 
         gradient = gradient.reshape((self.batch_size,
                                      self.patches_height, self.patches_width,
@@ -269,9 +269,9 @@ class GPTEmbedBack(Layer):
         if self.cache is not None:
             input = input[:, -1:, :]
         self.input = input
-        self.output = self.input @ self.table.transpose()
+        self.output = xp.tensordot(self.input, self.table.transpose(), axes = 1)
         return self.output
 
     def backward(self, gradient):
         self.table_grads += xp.tensordot(self.input.transpose(2, 0, 1), gradient, 2).transpose()
-        return gradient @ self.table
+        return xp.tensordot(gradient, self.table, axes = 1)

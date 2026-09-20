@@ -567,17 +567,17 @@ class MultiHeadAttention(Layer):
         B, T, C    = self.input.shape
 
         if self.fused:
-            qkv = self.input @ self.qkv_weights
+            qkv = xp.tensordot(self.input, self.qkv_weights, axes = 1)
             if self.qkv_bias is not None:
                 qkv = qkv + self.qkv_bias
             query, key, value = xp.split(qkv, 3, axis = 2)
         else:
-            query = self.input @ self.q_weights
-            key   = self.input @ self.k_weights
+            query = xp.tensordot(self.input, self.q_weights, axes = 1)
+            key   = xp.tensordot(self.input, self.k_weights, axes = 1)
             if self.q_bias is not None:
                 query = query + self.q_bias
                 key = key + self.k_bias
-            value = key if self.kv_shared else self.input @ self.v_weights
+            value = key if self.kv_shared else xp.tensordot(self.input, self.v_weights, axes = 1)
             if not self.kv_shared and self.v_bias is not None:
                 value = value + self.v_bias
 
@@ -647,7 +647,7 @@ class MultiHeadAttention(Layer):
         self.heads_out = self._merge_heads(outputs[0] if len(outputs) == 1 else
                                            xp.concatenate(outputs, axis = -2))
 
-        self.output = self.heads_out @ self.out_weights
+        self.output = xp.tensordot(self.heads_out, self.out_weights, axes = 1)
         if self.out_bias is not None:
             self.output = self.output + self.out_bias
         self.output = self.res_dropout.forward(self.output)
@@ -670,7 +670,7 @@ class MultiHeadAttention(Layer):
         self.out_weight_grads += xp.tensordot(self.heads_out.transpose(2, 0, 1), gradient, 2)
         if self.out_bias is not None:
             self.out_bias_grads += gradient.sum(axis=(0, 1))
-        gradient = gradient @ self.out_weights.transpose()
+        gradient = xp.tensordot(gradient, self.out_weights.transpose(), axes = 1)
 
         gradient = self._split_heads(gradient, self.num_kv_heads, self.groups)
 
@@ -721,7 +721,7 @@ class MultiHeadAttention(Layer):
             self.qkv_weight_grads += xp.tensordot(self.input.transpose(2, 0, 1), gradient, 2)
             if self.qkv_bias is not None:
                 self.qkv_bias_grads += gradient.sum(axis=(0, 1))
-            return gradient @ self.qkv_weights.transpose()
+            return xp.tensordot(gradient, self.qkv_weights.transpose(), axes = 1)
 
         if self.kv_shared:
             # one projection served as both key and value, so both paths accumulate onto it
@@ -733,13 +733,13 @@ class MultiHeadAttention(Layer):
             self.q_bias_grads += query_grads.sum(axis=(0, 1))
             self.k_bias_grads += key_grads.sum(axis=(0, 1))
 
-        gradient = query_grads @ self.q_weights.transpose() + key_grads @ self.k_weights.transpose()
+        gradient = xp.tensordot(query_grads, self.q_weights.transpose(), axes = 1) + xp.tensordot(key_grads, self.k_weights.transpose(), axes = 1)
 
         if not self.kv_shared:
             self.v_weight_grads += xp.tensordot(self.input.transpose(2, 0, 1), value_grads, 2)
             if self.v_bias is not None:
                 self.v_bias_grads += value_grads.sum(axis=(0, 1))
-            gradient = gradient + value_grads @ self.v_weights.transpose()
+            gradient = gradient + xp.tensordot(value_grads, self.v_weights.transpose(), axes = 1)
 
         return gradient
 
@@ -801,20 +801,20 @@ class TransformerFeedForward(Layer):
 
         self.input = input
         
-        activated = self.input @ self.act_weights
+        activated = xp.tensordot(self.input, self.act_weights, axes = 1)
         if self.act_bias is not None:
             activated = activated + self.act_bias
         self.act_output = self.activation.forward(activated)
         hidden = self.act_output
         
         if self.glu:
-            self.gate_output = self.input @ self.gate_weights
+            self.gate_output = xp.tensordot(self.input, self.gate_weights, axes = 1)
             if self.gate_bias is not None:
                 self.gate_output = self.gate_output + self.gate_bias
             hidden = hidden * self.gate_output
         
         self.hidden_output = self.dropout.forward(hidden)
-        self.output = self.hidden_output @ self.out_weights
+        self.output = xp.tensordot(self.hidden_output, self.out_weights, axes = 1)
         if self.out_bias is not None:
             self.output = self.output + self.out_bias
         self.output = self.output_dropout.forward(self.output)
@@ -830,19 +830,19 @@ class TransformerFeedForward(Layer):
         if self.out_bias is not None:
             self.out_bias_grads += gradient.sum(axis=(0, 1))
         
-        gradient = self.dropout.backward(gradient @ self.out_weights.transpose())
+        gradient = self.dropout.backward(xp.tensordot(gradient, self.out_weights.transpose(), axes = 1))
         act_gradient = self.activation.backward(gradient * self.gate_output if self.glu else gradient)
 
         self.act_weight_grads += xp.tensordot(self.input.transpose(2, 0, 1), act_gradient,  2)
         if self.act_bias is not None:
             self.act_bias_grads += act_gradient.sum(axis=(0, 1))
-        input_gradient = act_gradient @ self.act_weights.transpose()
+        input_gradient = xp.tensordot(act_gradient, self.act_weights.transpose(), axes = 1)
         if self.glu:
             gate_gradient = gradient * self.act_output
             self.gate_weight_grads += xp.tensordot(self.input.transpose(2, 0, 1), gate_gradient, 2)
             if self.gate_bias is not None:
                 self.gate_bias_grads += gate_gradient.sum(axis=(0, 1))
-            input_gradient = input_gradient + gate_gradient @ self.gate_weights.transpose()
+            input_gradient = input_gradient + xp.tensordot(gate_gradient, self.gate_weights.transpose(), axes = 1)
 
         return input_gradient
 
