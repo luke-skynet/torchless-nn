@@ -122,7 +122,6 @@ Layers built inside the context allocate no gradient, moment or variance buffers
 * **network.py** - Network framework class with Cross Entropy loss criterion and AdamW optimization.
 * **optimizer.py** - Fused CUDA AdamW updates and the NumPy reference implementation.
 * **transformer_adapters.py** - ViT image to tokens embedding, ViT MLP classification head, GPT embedding and GPT prediction layers.
-* **test_gemma.py** - Finite difference gradient checks for every layer, runnable on CPU (```python test_gemma.py```).
 * **backend.py** - Array backend selection (CuPy or NumPy), the FP32/TF32 float type, tensor initializers, and the `inference_mode` and `empty_weights` construction contexts.
 * **utils.py** - Layer interface, Residual Layer wrapper, the incremental decoding Cache, and basic image augmentation functions.
 
@@ -182,33 +181,3 @@ At 8192 allocated context, the 12B weights and RoPE tables occupy about 44.41 Gi
 KV caches and inference intermediates are additional. The full 262144-context tables
 raise the baseline to 45.86 GiB. Actual 12B GPU peak memory and speed still need to be
 measured on the VM.
-
-## Reference and regression tests
-
-Use a separate CPU environment with `requirements-test.txt`:
-
-```bash
-python -m pip install -r requirements-test.txt
-python test_gemma.py
-python -m pytest tests -q
-```
-
-The tests select the NumPy backend on CPU. They compare a deterministic tiny Gemma
-against Transformers 5.16.1 in FP32, including embeddings, attention, FFNs, norms,
-decoder outputs, logits, and cached decoding across sliding-window boundaries.
-They also round-trip sharded BF16, FP16 and FP32 weights, test malformed checkpoints,
-and compare text-to-token-to-generation results with reference greedy decoding.
-The official 12B tensor manifest is checked without allocating its weights.
-
-For actual CUDA parity, install both requirement sets and run:
-
-```bash
-CUPY_TF32=0 TORCHLESS_TEST_DEVICE=cuda python -m pytest tests -q
-```
-
-The CUDA suite requires a working NVIDIA GPU and a CUDA-enabled PyTorch installation.
-`tests/test_optimizer.py` checks multi-step Adam parity, shared storage, metadata
-replacement, frozen ViT positions, and (on CUDA) a single launch per update.
-CPU parity has been verified; CUDA parity and a full 12B forward pass have not yet
-been run. The source manifest in `tests/fixtures` contains only tensor names, shapes,
-dtypes, configuration, and revision metadata, not checkpoint weights.
