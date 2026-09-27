@@ -54,6 +54,8 @@ def parser():
     p.add_argument('--backend', choices=('numpy', 'cupy'),
                    default='numpy' if os.environ.get('XP_RUNTIME', 'CUDA') == 'CPU' else 'cupy')
     p.add_argument('--device', type=int, default=0)
+    p.add_argument('--dtype', choices=('float32', 'bfloat16'),
+                   default=os.environ.get('XP_PRECISION', 'float32'))
     p.add_argument('--tf32', action='store_true', help='Enable TF32; default FP32 is preferable for parity checks')
     p.add_argument('--inspect', action='store_true', help='Validate config and shard headers without CUDA or loading weights')
     p.add_argument('--report', type=Path, help='Also save JSON tensor accounting and timing metrics here')
@@ -85,9 +87,15 @@ def configure_backend(args):
     # Set TF32 before importing CuPy. --help and --inspect never need CUDA.
     if args.backend == 'numpy' and args.tf32:
         raise ValueError('--tf32 requires --backend cupy')
+    os.environ['XP_PRECISION'] = args.dtype
     os.environ['XP_RUNTIME'] = 'CPU' if args.backend == 'numpy' else 'CUDA'
     os.environ['CUPY_TF32'] = '1' if args.tf32 else '0'
-    from backend import xp
+    if args.backend == 'cupy':
+        import cupy
+        cupy.cuda.Device(args.device).use()
+    from backend import xp, MODEL_DTYPE
+    if MODEL_DTYPE.name != args.dtype:
+        raise ValueError("Precision already selected; set it before importing model modules")
     if xp.__name__ != args.backend:
         raise ValueError('Backend already imported; select the backend before importing the library')
     if args.backend == 'numpy':
@@ -147,7 +155,7 @@ def run_generation(args, checkpoint, tokens, stops):
     metrics = RunMetrics(xp)
     allocator = xp.cuda.using_allocator(metrics.allocate) if metrics.pool is not None else nullcontext()
     with allocator:
-        print(f'Loading {checkpoint.report["loaded_tensors"]} text tensors in FP32...', file=sys.stderr)
+        print(f'Loading {checkpoint.report["loaded_tensors"]} text tensors in {args.dtype}...', file=sys.stderr)
         metrics.event('load_start')
         model, report = checkpoint.load_model(chunk_size=args.chunk_size)
         metrics.event('load_end')
@@ -157,7 +165,7 @@ def run_generation(args, checkpoint, tokens, stops):
             top_k=args.top_k, step=args.prefill_step, stop=stops, on_event=metrics.event)
         ids = to_numpy(generated[0]).tolist()
 
-    report.update(metrics.report(len(tokens), len(ids)), backend=args.backend,
+    report.update(metrics.report(len(tokens), len(ids)), backend=args.backend, dtype=args.dtype,
                   tf32=args.tf32, device=args.device if args.backend == 'cupy' else None)
     return ids, report
 
@@ -168,7 +176,7 @@ def main(argv=None):
     from checkpoint import Checkpoint
 
     try:
-        checkpoint = Checkpoint(args.checkpoint, args.context_length)
+        checkpoint = Checkpoint(args.checkpoint, args.context_length, dtype=args.dtype)
         if args.inspect:
             print(json.dumps(checkpoint.report, indent=2))
             return 0

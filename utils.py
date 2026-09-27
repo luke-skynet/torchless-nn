@@ -83,6 +83,22 @@ class Cache:
 
 # layer interface and residual layer wrapper
 
+class Parameter:
+    """Compute storage and optional master/optimizer state, shared by identity."""
+
+    def __init__(self, value, inference_only, dtype=None):
+        dtype = np.dtype(backend.MODEL_DTYPE if dtype is None else dtype)
+        self.data = value.astype(dtype, copy=False)
+        self.master = self.grad = self.moment = self.variance = None
+        if not inference_only:
+            state_dtype = np.dtype(backend.FLOAT_TYPE) if dtype == backend.AMP_TYPE else dtype
+            self.master = (self.data if dtype != backend.AMP_TYPE else
+                           value.astype(state_dtype, copy=False))
+            self.grad = xp.zeros_like(self.master)
+            self.moment = xp.zeros_like(self.master)
+            self.variance = xp.zeros_like(self.master)
+
+
 class Layer:
 
     # activations stashed by forward for backward to consume. Listed per layer so
@@ -96,9 +112,6 @@ class Layer:
         self.output = None
 
         self.parameters = []
-        self.gradients = []
-        self.moments = []
-        self.variances = []
 
         self.eval_mode = False
         self.inference_only = backend.INFERENCE_MODE
@@ -108,28 +121,15 @@ class Layer:
         # BatchNorm's running statistics do
         self.cache = None
 
-    def register(self, parameter):
+    def register(self, value, dtype=None):
+        """Return compute storage and its accumulated gradient.
 
-        """Register a parameter and allocate its optimizer buffers.
-
-        Returns the gradient buffer, so layers can keep a named handle on it. Under
-        inference mode nothing is allocated and None is returned: the four lists stay
-        parallel because they all stay empty, which quietly makes zero_grad and the
-        optimizer step no-ops, and makes backward fail loudly on the None.
+        Initializers supply FP32 values so BF16 training retains their original
+        precision in the master. Inference keeps only the compute array.
         """
-
-        self.parameters.append(parameter)
-
-        if self.inference_only:
-            return None
-
-        gradient = init_zeros_tensor(parameter.shape)
-
-        self.gradients.append(gradient)
-        self.moments.append(init_zeros_tensor(parameter.shape))
-        self.variances.append(init_zeros_tensor(parameter.shape))
-
-        return gradient
+        p = Parameter(value, self.inference_only, dtype)
+        self.parameters.append(p)
+        return p.data, p.grad
 
     def clear_cache(self):
         for name in self.CACHED:
@@ -160,14 +160,16 @@ class Layer:
         self.eval_mode = eval_mode
 
     def zero_grad(self):
-        for grad in self.gradients:
-            grad.fill(0)
-    
+        for p in self.parameters:
+            if p.grad is not None:
+                p.grad.fill(0)
+
     def zero_adam(self):
-        for moment, variance in zip(self.moments, self.variances):
-            moment.fill(0)
-            variance.fill(0)
-            
+        for p in self.parameters:
+            if p.master is not None:
+                p.moment.fill(0)
+                p.variance.fill(0)
+
 
 class Residual(Layer):
     
@@ -180,15 +182,9 @@ class Residual(Layer):
         self.concat_axis = concat_axis
         
         self.parameters = []
-        self.gradients  = []
-        self.moments    = []
-        self.variances  = []
         
         for layer in layers:
             self.parameters = self.parameters + layer.parameters
-            self.gradients  = self.gradients  + layer.gradients
-            self.moments    = self.moments    + layer.moments
-            self.variances  = self.variances  + layer.variances
         
     def forward(self, input):
         

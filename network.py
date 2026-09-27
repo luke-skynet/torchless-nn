@@ -1,3 +1,4 @@
+import backend
 from backend import xp, FLOAT_TYPE
 
 import numpy as np
@@ -25,7 +26,8 @@ class CrossEntropy:
 
     def __init__(self, num_classes, eps = 1e-7):
         self.num_classes = num_classes
-        self.eps = eps
+        self.eps = FLOAT_TYPE(eps)
+        self._one = FLOAT_TYPE(1)
         self.positions = {}
 
     def _index(self, labels):
@@ -50,11 +52,11 @@ class CrossEntropy:
         # softmax output minus the one hot, without the one hot. Every (row, label)
         # pair is distinct, so the subtraction needs no scattered accumulation.
         gradient = logits.copy()
-        gradient[self._index(labels)] -= 1
+        gradient[self._index(labels)] -= self._one
         return gradient
 
     def loss(self, logits, labels):
-        return -1 * xp.sum(xp.log(logits[self._index(labels)] + self.eps))
+        return -xp.sum(xp.log(logits[self._index(labels)] + self.eps))
 
     def num_samples(self, labels):
         # One loss per image for classification, or per token for language models.
@@ -65,6 +67,7 @@ class Network:
 
     def __init__(self, layers:list[Layer]):
         self.layers = layers
+        self._zero = FLOAT_TYPE(0)
         self.rng    = xp.random.default_rng() # generation only; training draws nothing here
         self.optimizer = Adam()
 
@@ -87,6 +90,9 @@ class Network:
         return self._forward(input, logits=True)
 
     def _forward(self, input, logits=False):
+        input = xp.asarray(input)
+        if input.dtype.kind == 'f' or input.dtype == backend.AMP_TYPE:
+            input = input.astype(backend.MODEL_DTYPE, copy=False)
         for layer in (self.layers[:-1] if logits else self.layers):
             input = layer.forward(input)
             if layer.inference_only:
@@ -123,7 +129,7 @@ class Network:
             # keep the k largest and renormalize. partition puts the k largest last, so
             # entry -top_k is the threshold every survivor has to meet
             threshold     = xp.partition(probabilities, -top_k, axis = -1)[:, -top_k, None]
-            probabilities = xp.where(probabilities >= threshold, probabilities, 0.0)
+            probabilities = xp.where(probabilities >= threshold, probabilities, self._zero)
             probabilities = probabilities / xp.sum(probabilities, axis = -1, keepdims = True)
 
         # inverse transform sampling, vectorized over the batch. A vocab sized compare
@@ -214,7 +220,7 @@ class Network:
         self.set_eval(True)
         softmax = self.layers[-1]
         previous_temperature = softmax.temperature
-        softmax.temperature = temperature if temperature > 0 else 1.0
+        softmax.temperature = temperature if temperature > 0 else 1
         generated = []
         finished = xp.zeros((batch_size, 1), dtype=bool)
         try:
@@ -267,16 +273,10 @@ class Network:
         for layer in self.layers:
             if layer.inference_only:
                 raise RuntimeError('Cannot update an inference-only layer')
-            if len({len(layer.parameters), len(layer.gradients),
-                    len(layer.moments), len(layer.variances)}) != 1:
-                raise ValueError('Parameter and Adam state lists must have matching lengths')
-            for param, grad, moment, variance in zip(layer.parameters,
-                                                     layer.gradients,
-                                                     layer.moments,
-                                                     layer.variances):
-                decay = param.ndim != 1 and not isinstance(
+            for p in layer.parameters:
+                decay = p.data.ndim != 1 and not isinstance(
                     layer, (VitProjector, VitMLPHead, GPTEmbedFront, GPTEmbedBack))
-                entries.append((param, grad, moment, variance, decay))
+                entries.append((p.master, p.grad, p.moment, p.variance, decay, p.data))
         self.optimizer.step(entries, learning_rate, weight_decay, t, num_samples, eps)
 
     def train(self, criterion, train_data, train_labels, test_data = None, test_labels = None,
@@ -289,6 +289,7 @@ class Network:
                                "context to train.")
 
         step_count = 0
+        train_sample_count = FLOAT_TYPE(np.prod(train_labels.shape))
         
         self._zero_adam()
         
@@ -298,7 +299,7 @@ class Network:
 
             batches_seen = 0
             samples_in_step = 0
-            train_loss, train_correct = 0, 0
+            train_loss, train_correct = self._zero, 0
 
             shuffle = np.random.permutation(len(train_labels))
             train_data   = train_data[shuffle]
@@ -336,7 +337,7 @@ class Network:
                 step_count += 1
                 self._update(learning_rate, weight_decay, step_count, samples_in_step, eps=adam_eps)
 
-            train_loss     = train_loss    / np.prod(train_labels.shape)
+            train_loss     = train_loss    / train_sample_count
             train_accuracy = train_correct / np.prod(train_labels.shape)
             print("epoch:", i + 1, "train loss:", train_loss, "train accuracy:", train_accuracy)
             
@@ -347,7 +348,7 @@ class Network:
     def evaluate(self, test_data, test_labels, criterion, batch_size = 64):
         
         self.set_eval(True)
-        loss, correct = 0, 0
+        loss, correct = self._zero, 0
 
         for i in tqdm(range(0, len(test_data), batch_size)):
 
@@ -359,4 +360,4 @@ class Network:
             loss += criterion.loss(y_hat, y)
             correct += xp.equal(xp.argmax(y_hat, axis = -1), y).astype(xp.int32).sum()
 
-        return loss / np.prod(test_labels.shape), correct / np.prod(test_labels.shape)
+        return loss / FLOAT_TYPE(np.prod(test_labels.shape)), correct / np.prod(test_labels.shape)

@@ -1,5 +1,7 @@
 numpy>=2.1,<3
-cupy-cuda12x>=13.6,<15
+# Install the BF16-enabled CuPy build from luke-skynet/cupy (batched-16-fix).
+# A stock cupy-cuda12x installation may be used for FP32 only.
+ml_dtypes>=0.5,<1
 safetensors==0.8.0
 transformers==5.16.1
 tqdm>=4.67,<5

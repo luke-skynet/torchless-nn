@@ -1,9 +1,10 @@
 """Shared array backend: array module, float type, tensor initializers, and the
 inference_mode / empty_weights construction contexts.
 
-Select XP_RUNTIME=CPU before importing the library."""
+Select XP_RUNTIME=CPU or XP_PRECISION=bfloat16 before importing the library."""
 import os
 import numpy as np
+import ml_dtypes
 
 runtime = os.environ.get('XP_RUNTIME', 'CUDA')
 
@@ -11,7 +12,7 @@ assert runtime == "CUDA" or runtime == "CPU"
 
 if runtime == "CUDA":
 
-    os.environ['CUPY_TF32'] = "1"
+    os.environ.setdefault('CUPY_TF32', "1")
     os.environ['CUPY_ACCELERATORS'] = "cub,cutensor"
 
     import cupy
@@ -25,7 +26,22 @@ if runtime == "CUDA":
 else:
     xp = np
 
-FLOAT_TYPE = xp.float32 # (TF32 enabled for cupy)
+FLOAT_TYPE = xp.float32  # FP32 computation, training state, RNG, and positions.
+AMP_TYPE = np.dtype(ml_dtypes.bfloat16)  # Low-precision weight/activation storage.
+precision = os.environ.get('XP_PRECISION', 'float32')
+if precision not in ('float32', 'bfloat16'):
+    raise ValueError('XP_PRECISION must be float32 or bfloat16')
+if precision == 'bfloat16':
+    if xp is np:
+        raise ValueError('BF16 execution requires the patched CuPy CUDA backend')
+    if int(xp.cuda.Device().compute_capability) < 80:
+        raise ValueError('BF16 execution requires CUDA compute capability >= 8.0')
+    # Fail at construction rather than silently executing an FP32 model.
+    try:
+        xp.empty(0, dtype=AMP_TYPE)
+    except (TypeError, ValueError) as error:
+        raise RuntimeError('Install the BF16-enabled CuPy build') from error
+MODEL_DTYPE = AMP_TYPE if precision == 'bfloat16' else np.dtype(FLOAT_TYPE)
 
 
 def to_numpy(array):
@@ -82,8 +98,8 @@ def init_random_tensor(size):
     rng = xp.random.default_rng()
     return rng.standard_normal(size, dtype = FLOAT_TYPE)
 
-def init_zeros_tensor(size):
-    return xp.zeros(size, dtype = FLOAT_TYPE)
+def init_zeros_tensor(size, dtype=None):
+    return xp.zeros(size, dtype=MODEL_DTYPE if dtype is None else dtype)
 
 
 # Checkpoint construction allocates weight storage without random initialization.
@@ -106,5 +122,5 @@ class empty_weights:
 
 def init_weight_tensor(size, scale = 1.0):
     if EMPTY_WEIGHTS:
-        return xp.empty(size, dtype = FLOAT_TYPE)
-    return init_random_tensor(size) / scale
+        return xp.empty(size, dtype=MODEL_DTYPE)
+    return init_random_tensor(size) / FLOAT_TYPE(scale)

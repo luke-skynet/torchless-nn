@@ -6,8 +6,70 @@ All model operations use the shared `xp` backend in `backend.py`. CuPy is the de
 To use NumPy on CPU, set `XP_RUNTIME=CPU` before importing any library modules
 (or set `os.environ['XP_RUNTIME'] = 'CPU'` at the start of a notebook).
 Use `from backend import xp` when creating input arrays. Select one backend per process.
-NumPy execution does not require CuPy; for CPU-only runtime installation, omit the
-`cupy-cuda12x` line from `requirements.txt`.
+NumPy execution does not require CuPy. Install CuPy separately from the shared
+`requirements.txt`; this avoids replacing an installed patched build.
+
+## BF16 precision
+
+Set `XP_PRECISION=bfloat16` before importing the library to use BF16 weights,
+activations, residuals, and KV caches. The default remains `float32`. BF16 requires
+an NVIDIA GPU with compute capability 8.0 or later and the BF16-enabled CuPy build
+from [luke-skynet/cupy, batched-16-fix](https://github.com/luke-skynet/cupy/tree/batched-16-fix).
+Install that build separately; `requirements.txt` does not install or replace CuPy.
+For FP32-only CUDA execution, install the appropriate stock CuPy wheel separately.
+
+Training and inference use the same forward precision. Norm parameters and running
+statistics stay FP32. Kernels for normalization, RoPE, activation functions,
+softmax, dropout, and embedding-gradient scatter convert values in registers,
+without full-sized FP32 casting buffers. Norm statistics and training attention
+probabilities are intentionally retained in FP32. Final loss/sampling probabilities
+are FP32. Contractions use BF16 operands with FP32 internal accumulation and BF16
+outputs; accumulated parameter gradients are FP32, but the contraction output has
+already rounded to BF16. Loss scaling is not used.
+
+Training keeps FP32 master weights, gradients, and Adam moments. Adam updates the
+masters and refreshes BF16 compute weights in the same CUDA launch. Inference
+allocates none of that state. BF16 training therefore uses 18 bytes per ordinary
+parameter before activations (2 compute + 4 master + 4 gradient + 8 moments), versus
+16 for FP32 training; its savings are in activations and computation. BF16 inference
+uses two bytes per ordinary weight, with FP32 norm parameters and RoPE tables.
+
+```python
+# Set XP_RUNTIME=CUDA XP_PRECISION=bfloat16 before starting Python.
+from backend import inference_mode
+from checkpoint import load_checkpoint
+
+model, report = load_checkpoint('/models/gemma-4-12B-it')
+```
+
+```bash
+python generate.py --checkpoint /models/gemma-4-12B-it --dtype bfloat16 \
+  --prompt "Explain grouped-query attention." --max-new-tokens 128
+```
+
+BF16 checkpoints copy their original BF16 bits directly to BF16 destinations,
+with bounded contiguous staging for transposed weights. Norm tensors expand to
+FP32. F16/F32 source checkpoints remain supported, and training loads preserve
+source precision in the FP32 master. `--inspect --dtype bfloat16` estimates mixed
+storage without CUDA; actual loading reports destination array sizes.
+
+Parameters are represented by `Parameter` objects: `.data` is compute storage;
+`.master`, `.grad`, `.moment`, and `.variance` are optional training state.
+`Layer.register(array, dtype=None)` returns `(compute_array, gradient_array)`.
+Custom layers should retain both returned arrays and combine child `.parameters`
+lists when composing layers. Tied embeddings share one parameter object.
+
+Validation:
+
+```bash
+XP_RUNTIME=CPU python -m pytest -q
+XP_RUNTIME=CUDA XP_PRECISION=bfloat16 python -m pytest -q
+```
+
+The CUDA suite executes the fused kernels, BF16 GEMMs/einsum, Adam, checkpoint
+loading, cached decoding, and a short Gemma training run. GPU correctness and
+throughput must be measured on the target CUDA system; CPU checks do not establish
+GPU correctness or speedups.
 
 ## Attention
 
@@ -64,7 +126,7 @@ On CUDA, `optimizer.py` updates all registered parameters and clears their gradi
 in one kernel launch per optimizer step. It uses the existing arrays, supports
 C-contiguous float32 and float64 tensors (including both in the same model), and
 caches pointer metadata until storage or decay rules change. Each parameter's Adam
-state must match its shape and dtype. Identical shared entries are updated once;
+state must match its master weight's shape and dtype. Identical shared entries are updated once;
 conflicting optimizer state and overlapping storage are rejected. NumPy uses the
 reference update equations and also clears gradients during the update.
 
@@ -112,7 +174,7 @@ with inference_mode():
     model = gemma_gpt(**config)
 ```
 
-Layers built inside the context allocate no gradient, moment or variance buffers, and each layer's cached activations are released as soon as the next layer has consumed them. The Gemma 4 12B configuration holds about 45.86 GiB of FP32 weights and full-context RoPE tables; KV caches, activations, and CUDA workspace are additional. The 31B configuration requires about 115.86 GiB before those extras.
+Layers built inside the context allocate no gradient, moment or variance buffers, and each layer's cached activations are released as soon as the next layer has consumed them. With the default FP32 precision, the Gemma 4 12B configuration holds about 45.86 GiB of weights and full-context RoPE tables; KV caches, activations, and CUDA workspace are additional. The 31B configuration requires about 115.86 GiB before those extras.
 
 ## Modules
 
@@ -120,21 +182,22 @@ Layers built inside the context allocate no gradient, moment or variance buffers
 * **layers.py** - Convolution, BatchNorm, MaxPool, AveragePool, Flatten, Dense, Dropout, and Transformer (LayerNorm, RMSNorm, Attention, Rotary Embeddings, Gated Feed Forward, Logit Softcap) layers.
 * **gemma.py** - Gemma 4 style model assembly: grouped query attention, QK norm, sandwich norms, interleaved sliding window and global attention, and p-RoPE.
 * **network.py** - Network framework class with Cross Entropy loss criterion and AdamW optimization.
+* **precision_ops.py** - Fused CUDA kernels at BF16/FP32 computation boundaries.
 * **optimizer.py** - Fused CUDA AdamW updates and the NumPy reference implementation.
 * **transformer_adapters.py** - ViT image to tokens embedding, ViT MLP classification head, GPT embedding and GPT prediction layers.
-* **backend.py** - Array backend selection (CuPy or NumPy), the FP32/TF32 float type, tensor initializers, and the `inference_mode` and `empty_weights` construction contexts.
+* **backend.py** - Array backend selection (CuPy or NumPy), model precision selection, tensor initializers, and the `inference_mode` and `empty_weights` construction contexts.
 * **utils.py** - Layer interface, Residual Layer wrapper, the incremental decoding Cache, and basic image augmentation functions.
 
 ## Running Gemma 4 12B
 
-Text-only FP32 inference is implemented for the dense Gemma 4 Unified architecture.
+Text-only FP32 and BF16 inference is implemented for the dense Gemma 4 Unified architecture.
 It loads the original BF16/F16/F32 safetensors checkpoint, including tied embeddings,
 normalization scales, and per-layer scalars. Quantized checkpoints, multimodal inputs,
 MoE, and cross-layer KV sharing are rejected or unsupported.
 
 On a Linux NVIDIA VM with an appropriate CUDA 12 driver, create an environment and
-install `requirements.txt` (the CuPy wheel is for CUDA 12; choose the corresponding
-CuPy wheel if your VM uses another CUDA major version). PyTorch is not required for
+install `requirements.txt` and a CuPy build matching your CUDA version. Use the
+patched CuPy build for BF16, or a stock wheel for FP32. PyTorch is not required for
 loading or generation. OpenCV is only needed for the image augmentation examples.
 
 ```bash
@@ -173,7 +236,8 @@ Decode throughput includes sampling the first token from the prefill result.
 
 The loader validates all names/shapes before model allocation, skips random weight
 initialization, and copies bounded row chunks (normally at most 16 MiB of FP32 output
-per chunk). It memory-maps source tensors and performs BF16 conversion on the CPU.
+per chunk). It memory-maps source tensors. FP32 destinations expand BF16 on the CPU; BF16
+destinations receive the original bits.
 It never creates a second complete model on the GPU. The original checkpoint's
 vision/audio tensors are explicitly listed as skipped in the report.
 

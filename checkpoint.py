@@ -3,6 +3,8 @@ from dataclasses import dataclass
 from pathlib import Path
 import json
 import math
+import os
+import ml_dtypes
 import struct
 
 import numpy as np
@@ -213,7 +215,10 @@ def target_array(model, path):
 class Checkpoint:
     """Validate all shard headers before model allocation; mmap one tensor at a time."""
 
-    def __init__(self, directory, context_length=None, default_rms_norm_eps=1e-6):
+    def __init__(self, directory, context_length=None, default_rms_norm_eps=1e-6, dtype=None):
+        self.dtype = os.environ.get('XP_PRECISION', 'float32') if dtype is None else dtype
+        if self.dtype not in ('float32', 'bfloat16'):
+            raise ValueError('Checkpoint dtype must be float32 or bfloat16')
         self.directory = Path(directory).expanduser().resolve()
         self.raw_config = json.loads((self.directory / 'config.json').read_text())
         self.config = model_config(self.raw_config, context_length,
@@ -276,7 +281,11 @@ class Checkpoint:
             loaded_tensors=len(self.specs),
             skipped_tensors=self.skipped,
             verified_tied_aliases=self.aliases,
-            weight_and_scalar_bytes=sum(math.prod(spec.shape) * 4 for spec in self.specs.values()),
+            dtype=self.dtype,
+            storage_estimated=True,
+            weight_and_scalar_bytes=sum(
+                math.prod(spec.shape) * (4 if self.dtype == 'float32' or spec.target[-1] == 'gamma' else 2)
+                for spec in self.specs.values()),
             shards=len({tensor.path for tensor in self.tensors.values()}),
             context_length=self.config['context_length'],
         )
@@ -294,34 +303,64 @@ class Checkpoint:
         return np.memmap(tensor.path, mode='r', offset=tensor.offset, shape=tensor.shape,
                          dtype={'BF16': '<u2', 'F16': '<f2', 'F32': '<f4'}[tensor.dtype])
 
-    def chunks(self, name, transpose=False, chunk_bytes=16 * 1024**2):
+    def chunks(self, name, transpose=False, chunk_bytes=16 * 1024**2, dtype=np.float32):
         if chunk_bytes < 4:
             raise ValueError('chunk_bytes must be at least 4')
+        dtype = np.dtype(dtype)
+        amp_type = np.dtype(ml_dtypes.bfloat16)
         source = self._array(name)
+        if self.tensors[name].dtype == 'BF16':
+            source = source.view(amp_type)
         view = source.T if transpose else source
-        row_bytes = math.prod(view.shape[1:]) * 4
-        rows = max(1, chunk_bytes // max(4, row_bytes))
-        bf16 = self.tensors[name].dtype == 'BF16'
+        itemsize = max(view.dtype.itemsize, dtype.itemsize)
+        row_bytes = math.prod(view.shape[1:]) * itemsize
+        rows = max(1, chunk_bytes // max(itemsize, row_bytes))
+
+        def finite(array):
+            if array.dtype == amp_type:
+                return not np.any((array.view(np.uint16) & 0x7f80) == 0x7f80)
+            return bool(np.isfinite(array).all())
+
         for start in range(0, view.shape[0], rows):
             stop = min(start + rows, view.shape[0])
             block = view[start:stop]
-            if bf16:
-                block = (block.astype(np.uint32) << 16).view(np.float32)
-            block = np.ascontiguousarray(block, dtype=np.float32)
-            if not np.isfinite(block).all():
+            if not finite(block):
                 raise ValueError(f'{name}: non-finite checkpoint values')
+            # BF16 -> BF16 preserves bits; only transposed layout needs a copy.
+            with np.errstate(over='ignore', invalid='ignore'):
+                block = np.ascontiguousarray(block, dtype=dtype)
+            if not finite(block):
+                raise ValueError(f'{name}: non-finite converted checkpoint values')
             yield slice(start, stop), block
 
     def load_into(self, model, chunk_bytes=16 * 1024**2):
+        owners = {id(p.data): p for layer in model.layers for p in layer.parameters}
+        arrays = {}
         for name, spec in self.specs.items():
             destination = target_array(model, spec.target)
-            for rows, block in self.chunks(self.prefix + name, spec.transpose, chunk_bytes):
-                if hasattr(destination, 'set'):  # synchronous bounded host -> CUDA transfer
-                    destination[rows].set(block)
+            arrays[id(destination)] = destination
+            p = owners.get(id(destination))
+            training = p is not None and p.master is not None
+            source_name = self.prefix + name
+            # Non-BF16 sources retain their precision in training masters.
+            target = (p.master if training and self.tensors[source_name].dtype != 'BF16'
+                      else destination)
+            for rows, block in self.chunks(source_name, spec.transpose, chunk_bytes,
+                                           dtype=target.dtype):
+                if hasattr(target, 'set'):
+                    target[rows].set(block)
                 else:
-                    destination[rows] = block
+                    target[rows] = block
+                if training and p.master is not p.data:
+                    if target is p.master:
+                        p.data[rows] = p.master[rows]
+                    else:
+                        p.master[rows] = p.data[rows]
         self._verify_tied_aliases(chunk_bytes)
-        return dict(self.report)
+        report = dict(self.report)
+        report.update(weight_and_scalar_bytes=sum(a.nbytes for a in arrays.values()),
+                      storage_estimated=False)
+        return report
 
     def _verify_tied_aliases(self, chunk_bytes):
         for alias in self.aliases:
@@ -334,7 +373,9 @@ class Checkpoint:
     def load_model(self, chunk_size=256):
         """Construct and load from this already-validated checkpoint manifest."""
         from gemma import gemma_gpt
-        from backend import inference_mode, empty_weights
+        from backend import inference_mode, empty_weights, MODEL_DTYPE
+        if MODEL_DTYPE.name != self.dtype:
+            raise ValueError('Select XP_PRECISION before importing model modules')
 
         with inference_mode(), empty_weights():
             model = gemma_gpt(**self.config, chunk_size=chunk_size)
@@ -344,7 +385,7 @@ class Checkpoint:
 
 
 def load_checkpoint(directory, context_length=None, chunk_size=256, default_rms_norm_eps=1e-6):
-    """Return an inference-only FP32 model and its tensor accounting report.
+    """Return an inference-only model in the selected precision and its tensor accounting report.
 
     default_rms_norm_eps is used only when the checkpoint omits rms_norm_eps.
     An explicit checkpoint value always takes precedence.

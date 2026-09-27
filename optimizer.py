@@ -1,12 +1,13 @@
 """Adam updates: one CUDA launch across tensors, or a NumPy reference path."""
 import numpy as np
 
-from backend import xp
+from backend import xp, AMP_TYPE
 
 
 _CHUNK_SIZE = 4096
 _CUDA_SOURCE = r'''
-// NVRTC provides sqrt directly; avoid depending on host math headers.
+#include <cuda_bf16.h>
+// FP32 masters are updated and BF16 compute weights refreshed in one launch.
 
 template <typename T>
 __device__ void update_chunk(const unsigned long long* info,
@@ -29,6 +30,10 @@ __device__ void update_chunk(const unsigned long long* info,
         const T v_hat = v / T(correction2);
         const T p = param[i];
         param[i] = p - T(learning_rate) * (m_hat / (sqrt(v_hat) + T(epsilon)) + decay * p);
+        if (info[8]) {
+            __nv_bfloat16* compute = reinterpret_cast<__nv_bfloat16*>(info[7]);
+            compute[i] = __float2bfloat16_rn(float(param[i]));
+        }
         moment[i] = m;
         variance[i] = v;
         grad[i] = T(0);
@@ -39,7 +44,7 @@ extern "C" __global__ void adam_step(
     const unsigned long long* tensors, const unsigned long long* chunks,
     double learning_rate, double weight_decay, double num_samples,
     double correction1, double correction2, double epsilon) {
-    const unsigned long long* info = tensors + chunks[blockIdx.x * 2] * 7;
+    const unsigned long long* info = tensors + chunks[blockIdx.x * 2] * 9;
     const unsigned long long start = chunks[blockIdx.x * 2 + 1];
     if (info[6] == 4)
         update_chunk<float>(info, start, learning_rate, weight_decay, num_samples,
@@ -70,8 +75,9 @@ def _storage_bounds(array):
 class Adam:
     """Update and clear gradients, retaining the layers' existing array storage.
 
-    Entries are (parameter, gradient, moment, variance, decay_enabled). CUDA
-    supports contiguous float32 and float64 tensors, including both in one launch.
+    Entries are (master, gradient, moment, variance, decay_enabled, compute).
+    The optional compute array defaults to master for legacy five-item entries.
+    CUDA supports FP32/FP64 masters and BF16 compute weights with FP32 state.
     Metadata is rebuilt when storage, shape, dtype, or decay policy changes.
     """
 
@@ -81,7 +87,11 @@ class Adam:
         self._kernel = None
 
     def _prepare(self, entries):
-        signature = tuple((tuple(_array_key(a) for a in entry[:4]), bool(entry[4]))
+        # Five-element entries retain the existing FP32/FP64 public interface.
+        entries = [(*entry, entry[0]) if len(entry) == 5 else entry for entry in entries]
+        if any(len(entry) != 6 for entry in entries):
+            raise ValueError('Adam entries require master, gradient, moments, decay, and compute storage')
+        signature = tuple((tuple(_array_key(a) for a in (*entry[:4], entry[5])), bool(entry[4]))
                           for entry in entries)
         if signature == self._signature:
             return
@@ -91,9 +101,7 @@ class Adam:
         storage = []
         devices = set()
         for entry, (keys, decay) in zip(entries, signature):
-            param, grad, moment, variance, _ = entry
-            if len(keys) != 4:
-                raise ValueError('Adam requires a parameter and three state arrays')
+            param, grad, moment, variance, _, compute = entry
             if keys[0] in seen:
                 if seen[keys[0]] != (keys, decay):
                     raise ValueError('Shared parameters must share Adam state and decay policy')
@@ -111,7 +119,21 @@ class Adam:
                 devices.add(_array_key(array)[4])
                 if array.size:
                     storage.append(_storage_bounds(array))
-            unique.append((param, grad, moment, variance, decay))
+            if compute.shape != param.shape:
+                raise ValueError('Compute and master shapes must match')
+            if compute.dtype == AMP_TYPE:
+                if param.dtype != np.dtype('float32'):
+                    raise ValueError('BF16 compute weights require FP32 masters')
+                if xp is np:
+                    raise ValueError('BF16 Adam requires CUDA')
+                if not compute.flags.c_contiguous:
+                    raise ValueError('CUDA compute weights must be C-contiguous')
+                devices.add(keys[4][4])
+                if compute.size:
+                    storage.append(_storage_bounds(compute))
+            elif keys[4] != keys[0]:
+                raise ValueError('FP32/FP64 compute weights must alias their master')
+            unique.append((param, grad, moment, variance, decay, compute))
 
         if len(devices) > 1:
             raise ValueError('Adam arrays must be on a single device')
@@ -123,12 +145,12 @@ class Adam:
             device = next(iter(devices), xp.cuda.runtime.getDevice())
             tensors = []
             chunks = []
-            for index, (p, g, m, v, decay) in enumerate(unique):
+            for index, (p, g, m, v, decay, compute) in enumerate(unique):
                 tensors.append([p.data.ptr, g.data.ptr, m.data.ptr, v.data.ptr,
-                                p.size, int(decay), p.itemsize])
+                                p.size, int(decay), p.itemsize, compute.data.ptr, int(compute.dtype == AMP_TYPE)])
                 chunks.extend((index, start) for start in range(0, p.size, _CHUNK_SIZE))
             with xp.cuda.Device(device):
-                self._tensors = xp.asarray(np.asarray(tensors, dtype=np.uint64).reshape(-1, 7))
+                self._tensors = xp.asarray(np.asarray(tensors, dtype=np.uint64).reshape(-1, 9))
                 self._chunks = xp.asarray(np.asarray(chunks, dtype=np.uint64).reshape(-1, 2))
                 self._metadata_ready = xp.cuda.Event()
                 self._metadata_ready.record()
@@ -157,7 +179,7 @@ class Adam:
 
     def _reference_step(self, learning_rate, weight_decay, t, num_samples, eps):
         beta1, beta2 = 0.9, 0.999
-        for param, grad, moment, variance, decay in self.entries:
+        for param, grad, moment, variance, decay, compute in self.entries:
             grad /= num_samples
             moment *= beta1
             moment += (1 - beta1) * grad
