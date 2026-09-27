@@ -95,7 +95,7 @@ class BatchNorm(Layer):
         self._running_decay = self._one - self._momentum
 
     def forward(self, input):
-        if ops.is_bf16(input):
+        if ops.use_kernels(input):
             self.input = input
             self.output, self.mean, self.var, self.inv = ops.norm_forward(
                 input, self.gamma, self.beta, (0, 2, 3), self.eps,
@@ -128,7 +128,7 @@ class BatchNorm(Layer):
         return self.output
             
     def backward(self, gradient):
-        if ops.is_bf16(self.input):
+        if ops.use_kernels(self.input):
             dx, dg, db = ops.norm_backward(
                 gradient, self.input, self.gamma, self.mean, self.inv,
                 (0, 2, 3), (0, 2, 3), rms=False, param_keepdims=True,
@@ -334,7 +334,7 @@ class RMSNorm(Layer):
         self.gamma, self.gamma_grads = self.register(self.gamma, dtype=FLOAT_TYPE) if with_scale else (self.gamma, None)
 
     def forward(self, input):
-        if ops.is_bf16(input):
+        if ops.use_kernels(input):
             self.input = input
             self.output, self.mean, self.var, self.inv = ops.norm_forward(
                 input, self.gamma, self._zero, (-1,), self.eps,
@@ -351,7 +351,7 @@ class RMSNorm(Layer):
         return self.output
 
     def backward(self, gradient):
-        if ops.is_bf16(self.input):
+        if ops.use_kernels(self.input):
             dx, dg, db = ops.norm_backward(
                 gradient, self.input, self.gamma, self.mean, self.inv,
                 (-1,), tuple(range(gradient.ndim - 1)), rms=True, param_keepdims=False,
@@ -419,7 +419,7 @@ class RotaryEmbedding:
         length = x.shape[-2]
         cos = self.cos[offset : offset + length]
         sin = self.sin[offset : offset + length]
-        if ops.is_bf16(x):
+        if ops.use_kernels(x):
             return ops.rope(x, cos, sin, self.rotary_dim)
 
         if self.rotary_dim == self.head_dim:
@@ -434,7 +434,7 @@ class RotaryEmbedding:
         length = gradient.shape[-2]
         cos = self.cos[offset : offset + length]
         sin = self.sin[offset : offset + length]
-        if backend.MODEL_DTYPE == backend.AMP_TYPE:
+        if ops.use_kernels(gradient):
             return ops.rope(gradient, cos, sin, self.rotary_dim, backward=True)
 
         if self.rotary_dim == self.head_dim:
@@ -710,7 +710,7 @@ class MultiHeadAttention(Layer):
 
             attends = (self.query[:, :, :, q0:q1, :] @
                        self.key[:, :, :, k0-base:k1-base, :].transpose(0, 1, 2, 4, 3))
-            if ops.is_bf16(attends):
+            if ops.use_kernels(attends):
                 mask = self.attn_dropout.make_mask(attends.shape)
                 dropped, probabilities = ops.softmax(
                     attends, self.value.dtype,
@@ -788,7 +788,7 @@ class MultiHeadAttention(Layer):
             value_grads[:, :, :, k0:k1, :] += (dropped.transpose(0, 1, 2, 4, 3) @ block).sum(axis = 2, keepdims = True, dtype=FLOAT_TYPE)
 
             block = block @ self.value[:, :, :, k0:k1, :].transpose(0, 1, 2, 4, 3)
-            if ops.is_bf16(self.query):
+            if ops.use_kernels(self.query):
                 block = ops.softmax_backward(
                     block, attends, self.query.dtype, mask=mask,
                     dropout_scale=self.attn_dropout._dropout_scale,
@@ -997,7 +997,7 @@ class LayerNorm(Layer):
         self.beta, self.beta_grads = self.register(self.beta, dtype=FLOAT_TYPE)
 
     def forward(self, input):
-        if ops.is_bf16(input):
+        if ops.use_kernels(input):
             self.input = input
             self.output, self.mean, self.var, self.inv = ops.norm_forward(
                 input, self.gamma, self.beta, (-1,), self.eps,
@@ -1019,7 +1019,7 @@ class LayerNorm(Layer):
         return self.output
 
     def backward(self, gradient):
-        if ops.is_bf16(self.input):
+        if ops.use_kernels(self.input):
             dx, dg, db = ops.norm_backward(
                 gradient, self.input, self.gamma, self.mean, self.inv,
                 (-1,), tuple(range(gradient.ndim - 1)), rms=False, param_keepdims=False,
@@ -1072,7 +1072,7 @@ class Softcap(Layer):
 
     def forward(self, input):
         self.input = input
-        if ops.is_bf16(input):
+        if ops.use_kernels(input):
             self.output = ops.activation(input, 'softcap', cap=self.cap)
             return self.output
         self.tanh   = xp.tanh(input / self.cap)
@@ -1080,7 +1080,7 @@ class Softcap(Layer):
         return self.output
 
     def backward(self, gradient):
-        if ops.is_bf16(self.input):
+        if ops.use_kernels(self.input):
             return ops.activation(self.input, 'softcap', gradient, cap=self.cap)
         return gradient * (self._one - self.tanh**self._two)
 

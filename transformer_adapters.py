@@ -197,7 +197,7 @@ class GPTEmbedFront(Layer):
         self.positional_encoding = None
         self.positional_encoding_grads = None
         if positional == "sinusoidal":
-            if backend.MODEL_DTYPE == backend.AMP_TYPE:
+            if ops.use_kernels(self.table):
                 self.positional_encoding = ops.sinusoidal(
                     context_length, self.table.shape[1], self.table.dtype)
             else:

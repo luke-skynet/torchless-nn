@@ -1,9 +1,9 @@
-"""BF16 boundaries with FP32 arithmetic inside CUDA kernels.
+"""Shared FP32/BF16 CUDA kernels with FP32 arithmetic.
 
 No full-sized FP32 cast buffers are needed for norms, RoPE, activations,
 softmax, dropout, or embedding scatter. Small norm statistics and training
-softmax probabilities deliberately remain FP32. The ordinary FP32 layer paths
-remain the reference implementation.
+softmax probabilities deliberately remain FP32. NumPy retains the ordinary
+layer reference paths.
 """
 from functools import lru_cache
 import math
@@ -33,6 +33,11 @@ def _reduction_count(shape, axes):
 
 def is_bf16(x):
     return x.dtype == AMP_TYPE
+
+
+def use_kernels(x):
+    """Use shared CUDA kernels only for their supported storage dtypes."""
+    return xp is not np and (x.dtype == np.dtype(FLOAT_TYPE) or is_bf16(x))
 
 
 @lru_cache(None)
@@ -134,8 +139,8 @@ def rope(x, cos, sin, rotary_dim, backward=False, dtype=None):
 
 
 def scatter_embedding(dest, ids, gradient, factor):
-    """Convert/scale BF16 gradient values in registers, then FP32 atomicAdd."""
-    if xp is np or not is_bf16(gradient):
+    """Scale FP32/BF16 gradients in registers, then FP32 atomicAdd."""
+    if not use_kernels(gradient):
         xp.add.at(dest, ids, gradient * _array_scalar(factor, gradient.dtype))
         return
     _elementwise('T g, raw I ids, int64 width, int64 vocab, float32 factor',

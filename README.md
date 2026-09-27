@@ -19,9 +19,10 @@ Install that build separately; `requirements.txt` does not install or replace Cu
 For FP32-only CUDA execution, install the appropriate stock CuPy wheel separately.
 
 Training and inference use the same forward precision. Norm parameters and running
-statistics stay FP32. Kernels for normalization, RoPE, activation functions,
-softmax, dropout, and embedding-gradient scatter convert values in registers,
-without full-sized FP32 casting buffers. Norm statistics and training attention
+statistics stay FP32. CUDA FP32 and BF16 share kernels for normalization, RoPE,
+activation functions, softmax, dropout, and embedding-gradient scatter. These compute in FP32 and store
+in the requested dtype, without full-sized FP32 casting buffers. NumPy retains
+the reference implementations. Norm statistics and training attention
 probabilities are intentionally retained in FP32. Final loss/sampling probabilities
 are FP32. Contractions use BF16 operands with FP32 internal accumulation and BF16
 outputs; accumulated parameter gradients are FP32, but the contraction output has
@@ -63,6 +64,7 @@ Validation:
 
 ```bash
 XP_RUNTIME=CPU python -m pytest -q
+XP_RUNTIME=CUDA XP_PRECISION=float32 python -m pytest -q
 XP_RUNTIME=CUDA XP_PRECISION=bfloat16 python -m pytest -q
 ```
 

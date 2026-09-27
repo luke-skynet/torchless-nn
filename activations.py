@@ -24,14 +24,14 @@ class ReLU(Layer):
 
     def forward(self, input):
         self.input = input
-        if ops.is_bf16(input):
+        if ops.use_kernels(input):
             self.output = ops.activation(input, 'relu')
             return self.output
         self.output = xp.maximum(input, self._zero)
         return self.output
 
     def backward(self, gradient):
-        if ops.is_bf16(self.input):
+        if ops.use_kernels(self.input):
             return ops.activation(self.input, 'relu', gradient)
         return xp.heaviside(self.input, self._zero) * gradient
 
@@ -53,7 +53,7 @@ class GeLU(Layer):
 
     def forward(self, input):
         self.input = input
-        if ops.is_bf16(input):
+        if ops.use_kernels(input):
             self.output = ops.activation(input, 'gelu')
             return self.output
         self.cdf = self._half * (self._one + _erf(input / self._sqrt_two))
@@ -61,7 +61,7 @@ class GeLU(Layer):
         return self.output
 
     def backward(self, gradient):
-        if ops.is_bf16(self.input):
+        if ops.use_kernels(self.input):
             return ops.activation(self.input, 'gelu', gradient)
         return (self.cdf + self.input * xp.exp(self._negative_half * self.input**self._two) / self._sqrt_two_pi) * gradient
 
@@ -84,7 +84,7 @@ class GeLUTanh(Layer):
 
     def forward(self, input):
         self.input = input
-        if ops.is_bf16(input):
+        if ops.use_kernels(input):
             self.output = ops.activation(input, 'gelutanh')
             return self.output
         self.tanh = xp.tanh(self._sqrt_two_over_pi * (self.input + self._cubic_coefficient*self.input**self._three))
@@ -92,7 +92,7 @@ class GeLUTanh(Layer):
         return self.output
 
     def backward(self, gradient):
-        if ops.is_bf16(self.input):
+        if ops.use_kernels(self.input):
             return ops.activation(self.input, 'gelutanh', gradient)
         return (self._half * (self._one + self.tanh) + \
                 self._half * self.input * (self._one - self.tanh**self._two) * \
@@ -110,7 +110,7 @@ class SiLU(Layer):
 
     def forward(self, input):
         self.input = input
-        if ops.is_bf16(input):
+        if ops.use_kernels(input):
             self.output = ops.activation(input, 'silu')
             return self.output
         self.sigmoid = (self._one + xp.tanh(self.input / self._two)) / self._two
@@ -118,7 +118,7 @@ class SiLU(Layer):
         return self.output
 
     def backward(self, gradient):
-        if ops.is_bf16(self.input):
+        if ops.use_kernels(self.input):
             return ops.activation(self.input, 'silu', gradient)
         return (self.sigmoid + self.output - self.sigmoid * self.output) * gradient
 
@@ -156,7 +156,7 @@ class SoftMax(Layer):
 
     def forward(self, input):
         self.input = input
-        if ops.is_bf16(input):
+        if ops.use_kernels(input):
             self.output, self.probabilities = ops.softmax(
                 input, FLOAT_TYPE if self.fused_loss else input.dtype,
                 scale=self._inverse_temperature,
@@ -170,7 +170,7 @@ class SoftMax(Layer):
         return self.output
 
     def backward(self, gradient):
-        if ops.is_bf16(self.input):
+        if ops.use_kernels(self.input):
             if self.fused_loss:
                 return ops.scale(gradient, self._inverse_temperature, self.input.dtype)
             return ops.softmax_backward(gradient, self.probabilities,
