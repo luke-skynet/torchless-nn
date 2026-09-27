@@ -15,7 +15,7 @@ class Convolution(Layer):
         self.padded_input = None
 
         self.weights = init_random_tensor((num_kernels, input_dim[0], kernel_size[0], kernel_size[1]))
-        self.weights = self.weights / (input_dim[0] * kernel_size[0] * kernel_size[1])**0.5
+        self.weights = self.weights / FLOAT_TYPE((0.5 * input_dim[0] * kernel_size[0] * kernel_size[1])**0.5)
         self.bias    = init_zeros_tensor(num_kernels).reshape(1, num_kernels, 1, 1)
         
         self.weight_grads   = self.register_param(self.weights)
@@ -197,7 +197,7 @@ class Dense(Layer):
     def __init__(self, input_size, output_size):
         super(Dense, self).__init__()
 
-        self.weights = init_random_tensor((input_size, output_size)) / input_size**0.5
+        self.weights = init_random_tensor((input_size, output_size)) / FLOAT_TYPE((0.5 * input_size)**0.5)
         self.bias    = init_zeros_tensor(output_size)
 
         self.weight_grads = self.register_param(self.weights)
@@ -266,10 +266,10 @@ class MultiHeadAttention(Layer):
         self.attn_dropout = Dropout(attn_dropout_rate)
         self.res_dropout  = Dropout(res_dropout_rate)  
         
-        self.qkv_weights = init_random_tensor((embedding_dim, 3*embedding_dim)) / embedding_dim**0.5
+        self.qkv_weights = init_random_tensor((embedding_dim, 3*embedding_dim)) / FLOAT_TYPE((0.5 * embedding_dim)**0.5)
         self.qkv_bias    = init_zeros_tensor(3*embedding_dim)
         
-        self.out_weights = init_random_tensor((embedding_dim,   embedding_dim)) / embedding_dim**0.5
+        self.out_weights = init_random_tensor((embedding_dim,   embedding_dim)) / FLOAT_TYPE((0.5 * embedding_dim)**0.5)
         self.out_bias    = init_zeros_tensor(embedding_dim)
 
         self.qkv_weight_grads = self.register_param(self.qkv_weights)
@@ -353,10 +353,10 @@ class TransformerFeedForward(Layer):
         
         self.hidden_output = None
 
-        self.weights1 = init_random_tensor((  num_channels, 4*num_channels)) / num_channels**0.5
+        self.weights1 = init_random_tensor((  num_channels, 4*num_channels)) / FLOAT_TYPE((0.5 * num_channels)**0.5)
         self.bias1    = init_zeros_tensor(4*num_channels)
         
-        self.weights2 = init_random_tensor((4*num_channels,   num_channels)) / num_channels**0.5
+        self.weights2 = init_random_tensor((4*num_channels,   num_channels)) / FLOAT_TYPE((2 * num_channels)**0.5)
         self.bias2    = init_zeros_tensor(num_channels)
 
         self.weight_grads1 = self.register_param(self.weights1)
