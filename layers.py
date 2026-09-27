@@ -59,9 +59,9 @@ class BatchNorm(Layer):
         super(BatchNorm, self).__init__()
         
         self.channels = num_channels
-        self.eps = 1e-5
+        self.eps = FLOAT_TYPE(1e-5)
         
-        self.momentum = 0.1
+        self.momentum = FLOAT_TYPE(0.1)
         
         self.running_mean = init_zeros_tensor((1, num_channels, 1, 1))
         self.running_var  = init_zeros_tensor((1, num_channels, 1, 1))
@@ -93,7 +93,7 @@ class BatchNorm(Layer):
             
         self.centered = self.input - self.mean
         
-        self.std = (self.var + self.eps)**0.5
+        self.std = (self.var + self.eps)**FLOAT_TYPE(0.5)
         self.normed = self.centered / self.std
         
         self.output = self.gamma * self.normed + self.beta
@@ -290,7 +290,7 @@ class MultiHeadAttention(Layer):
         self.key_t = self.key_t.reshape((B, T, self.num_heads, self.heads_dim)).transpose(0, 2, 3, 1)
         self.value = self.value.reshape((B, T, self.num_heads, self.heads_dim)).transpose(0, 2, 1, 3)
 
-        attends = (self.query @ self.key_t) / self.heads_dim**.5
+        attends = (self.query @ self.key_t) / FLOAT_TYPE(self.heads_dim**0.5)
 
         if self.is_decoder:
             attends += self.mask[:T,:T]
@@ -322,7 +322,7 @@ class MultiHeadAttention(Layer):
         gradient = self.attn_dropout.backward(gradient)
 
         gradient = self.softmax * (gradient - (gradient * self.softmax).sum(axis = -1, keepdims=True))
-        gradient = gradient / self.heads_dim**.5
+        gradient = gradient / FLOAT_TYPE(self.heads_dim**0.5)
 
         key_t_grads = self.query.transpose(0, 1, 3, 2) @ gradient
         query_grads = gradient @ self.key_t.transpose(0, 1, 3, 2)
@@ -398,7 +398,7 @@ class LayerNorm(Layer):
         super(LayerNorm, self).__init__()
 
         self.channels = num_channels
-        self.eps = 1e-5
+        self.eps = FLOAT_TYPE(1e-5)
 
         self.gamma = init_zeros_tensor(num_channels) + 1
         self.beta  = init_zeros_tensor(num_channels)
@@ -421,7 +421,7 @@ class LayerNorm(Layer):
 
         self.centered = input - self.mean
 
-        self.std = (self.var + self.eps)**0.5
+        self.std = (self.var + self.eps)**FLOAT_TYPE(0.5)
         self.normed = self.centered / self.std
 
         self.output = self.gamma * self.normed + self.beta

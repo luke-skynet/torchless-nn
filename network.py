@@ -58,7 +58,7 @@ class Network:
 
     def _update(self, learning_rate, weight_decay, t, num_samples):
 
-        beta1, beta2 = 0.9, 0.999
+        beta1, beta2 = FLOAT_TYPE(0.9), FLOAT_TYPE(0.99)
 
         for layer in self.layers:
             if layer.is_embed_layer_back:
@@ -73,7 +73,7 @@ class Network:
                 
                 if len(param.shape) == 1 or isinstance(layer, (VitProjector, VitMLPHead, 
                                                                GPTEmbedFront, GPTEmbedBack)):
-                    lmda = 0.0
+                    lmda = FLOAT_TYPE(0.0)
                     
                 moment *= beta1
                 moment += (1 - beta1)*grad
@@ -84,11 +84,11 @@ class Network:
                 mom_hat = moment / (1 - beta1**t)
                 var_hat = variance / (1 - beta2**t)
 
-                param -= learning_rate * (mom_hat / (var_hat**0.5 + 1e-7) + lmda * param)
+                param -= learning_rate * (mom_hat / (var_hat**FLOAT_TYPE(0.5) + FLOAT_TYPE(1e-7)) + lmda * param)
 
     def train(self, criterion, train_data, train_labels, test_data = None, test_labels = None,
                     augments = None, epochs = 1, batch_size = 64, batches_per_step = 1,
-                    learning_rate = 0.001, weight_decay = 0.01):
+                    learning_rate = FLOAT_TYPE(0.001), weight_decay = FLOAT_TYPE(0.01)):
 
         step_count = 1
         self._zero_adam()
@@ -114,7 +114,7 @@ class Network:
                 if augments is not None:
                     x = augments(x)
 
-                x = xp.array(x)
+                x = xp.array(x, dtype = FLOAT_TYPE)
                 y = xp.array(y)
                 
                 y_hat = self._forward(x)
@@ -149,7 +149,7 @@ class Network:
 
         for i in tqdm(range(0, len(test_data), batch_size)):
 
-            x = xp.array(test_data  [i: min(i + batch_size, len(test_data))])
+            x = xp.array(test_data  [i: min(i + batch_size, len(test_data))], dtype = FLOAT_TYPE)
             y = xp.array(test_labels[i: min(i + batch_size, len(test_data))])
 
             y_hat = self.predict(x)

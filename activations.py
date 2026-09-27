@@ -50,7 +50,7 @@ class SiLU(Layer):
 
 class SoftMax(Layer):
 
-    def __init__(self, temperature = 1.0):
+    def __init__(self, temperature = FLOAT_TYPE(1.0)):
         super(SoftMax, self).__init__()
         self.temperature = temperature
 
