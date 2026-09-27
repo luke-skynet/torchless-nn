@@ -1,4 +1,4 @@
-import precision_ops as ops
+import kernel_ops as ops
 from backend import xp, FLOAT_TYPE
 import math
 import numpy as np

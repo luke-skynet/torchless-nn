@@ -1,5 +1,5 @@
 import backend
-import precision_ops as ops
+import kernel_ops as ops
 from backend import xp, FLOAT_TYPE, init_random_tensor, init_zeros_tensor, init_weight_tensor
 
 from utils import Layer
@@ -57,7 +57,9 @@ class Convolution(Layer):
         return gradient
 
 class BatchNorm(Layer):
-    CACHED = ("inv", "input", "output", "mean", "var", "std", "centered", "normed")
+    """Per-channel NCHW normalization with population running variance."""
+
+    CACHED = ("inv_std", "input", "output", "mean", "var", "std", "centered", "normed")
 
     def __init__(self, num_channels, eps = 1e-5):
         super(BatchNorm, self).__init__()
@@ -78,6 +80,7 @@ class BatchNorm(Layer):
 
         self.mean = None
         self.var = None
+        self.inv_std = None
         self.std = None
         self.centered = None
         self.normed = None
@@ -95,48 +98,37 @@ class BatchNorm(Layer):
         self._running_decay = self._one - self._momentum
 
     def forward(self, input):
-        if ops.use_kernels(input):
-            self.input = input
-            self.output, self.mean, self.var, self.inv = ops.norm_forward(
-                input, self.gamma, self.beta, (0, 2, 3), self.eps,
-                rms=False, stats=(self.running_mean, self.running_var) if self.eval_mode else None)
-            if not self.eval_mode:
-                self.running_mean *= self._running_decay
-                self.running_mean += self.momentum * self.mean
-                self.running_var *= self._running_decay
-                self.running_var += self.momentum * self.var
-            return self.output
-
-        
         self.input = input
-        
-        if self.eval_mode is False:
-            self.mean = xp.mean(input, axis = (0, 2, 3), keepdims = True)
-            self.var  = xp.var(input, axis = (0, 2, 3), keepdims = True)
-            self.running_mean = (self._running_decay) * self.running_mean + self.momentum * self.mean
-            self.running_var  = (self._running_decay) * self.running_var  + self.momentum * self.var
+        if ops.use_kernels(input):
+            self.output, self.mean, self.var, self.inv_std = ops.batch_norm_forward(
+                input, self.gamma, self.beta, self.eps,
+                statistics=(self.running_mean, self.running_var) if self.eval_mode else None)
         else:
-            self.mean = self.running_mean
-            self.var = self.running_var
-            
-        self.centered = self.input - self.mean
-        
-        self.std = (self.var + self.eps)**self._half
-        self.normed = self.centered / self.std
-        
-        self.output = self.gamma * self.normed + self.beta
+            if self.eval_mode:
+                self.mean, self.var = self.running_mean, self.running_var
+            else:
+                self.mean = xp.mean(input, axis=(0, 2, 3), keepdims=True)
+                self.var = xp.var(input, axis=(0, 2, 3), keepdims=True)
+            self.centered = input - self.mean
+            self.std = (self.var + self.eps)**self._half
+            self.normed = self.centered / self.std
+            self.output = self.gamma * self.normed + self.beta
+
+        if not self.eval_mode:
+            self.running_mean *= self._running_decay
+            self.running_mean += self.momentum * self.mean
+            self.running_var *= self._running_decay
+            self.running_var += self.momentum * self.var
         return self.output
             
     def backward(self, gradient):
         if ops.use_kernels(self.input):
-            dx, dg, db = ops.norm_backward(
-                gradient, self.input, self.gamma, self.mean, self.inv,
-                (0, 2, 3), (0, 2, 3), rms=False, param_keepdims=True,
-                with_scale=self.gamma_grads is not None, with_bias=True)
+            input_gradient, gamma_grads, beta_grads = ops.batch_norm_backward(
+                gradient, self.input, self.gamma, self.mean, self.inv_std)
             if self.gamma_grads is not None:
-                self.gamma_grads += dg
-            self.beta_grads += db
-            return dx
+                self.gamma_grads += gamma_grads
+            self.beta_grads += beta_grads
+            return input_gradient
 
         
         self.gamma_grads += xp.sum(gradient * self.normed, axis = (0, 2, 3), keepdims = True, dtype=FLOAT_TYPE)
@@ -314,35 +306,29 @@ class RMSNorm(Layer):
     Gemma 4 checkpoints store gamma directly; no offset is added when loading.
     """
 
-    CACHED = ("mean", "var", "inv", "input", "output", "normed", "rms")
+    CACHED = ("inv_rms", "input", "output", "normed", "rms")
 
     def __init__(self, num_channels, eps = 1e-6, with_scale = True):
         super(RMSNorm, self).__init__()
         self._half = FLOAT_TYPE(0.5)
         self._one = FLOAT_TYPE(1)
-        self._zero = FLOAT_TYPE(0)
 
         self.channels = num_channels
-        self._norm_count = FLOAT_TYPE(num_channels)
         self.eps = FLOAT_TYPE(eps)
 
         self.gamma = init_zeros_tensor(num_channels, dtype=FLOAT_TYPE) + self._one if with_scale else self._one
 
         self.rms = None
+        self.inv_rms = None
         self.normed = None
 
         self.gamma, self.gamma_grads = self.register(self.gamma, dtype=FLOAT_TYPE) if with_scale else (self.gamma, None)
 
     def forward(self, input):
-        if ops.use_kernels(input):
-            self.input = input
-            self.output, self.mean, self.var, self.inv = ops.norm_forward(
-                input, self.gamma, self._zero, (-1,), self.eps,
-                rms=True, stats=None, count=self._norm_count)
-            return self.output
-
-
         self.input = input
+        if ops.use_kernels(input):
+            self.output, self.inv_rms = ops.rms_norm_forward(input, self.gamma, self.eps)
+            return self.output
 
         self.rms    = (xp.mean(input * input, axis = -1, keepdims = True) + self.eps)**self._half
         self.normed = input / self.rms
@@ -352,13 +338,12 @@ class RMSNorm(Layer):
 
     def backward(self, gradient):
         if ops.use_kernels(self.input):
-            dx, dg, db = ops.norm_backward(
-                gradient, self.input, self.gamma, self.mean, self.inv,
-                (-1,), tuple(range(gradient.ndim - 1)), rms=True, param_keepdims=False,
-                with_scale=self.gamma_grads is not None, with_bias=False, count=self._norm_count)
+            input_gradient, gamma_grads = ops.rms_norm_backward(
+                gradient, self.input, self.gamma, self.inv_rms,
+                with_scale=self.gamma_grads is not None)
             if self.gamma_grads is not None:
-                self.gamma_grads += dg
-            return dx
+                self.gamma_grads += gamma_grads
+            return input_gradient
 
 
         # Sum contributions wherever gamma is shared. The optimizer normalizes
@@ -971,8 +956,9 @@ class TransformerFeedForward(Layer):
 GatedFeedForward = TransformerFeedForward
 
 class LayerNorm(Layer):
+    """Center and normalize the last axis, with per-feature scale and bias."""
 
-    CACHED = ("inv", "input", "output", "mean", "var", "std", "centered", "normed")
+    CACHED = ("inv_std", "input", "output", "mean", "var", "std", "centered", "normed")
 
     def __init__(self, num_channels, eps = 1e-5):
         super(LayerNorm, self).__init__()
@@ -981,7 +967,6 @@ class LayerNorm(Layer):
         self._one = FLOAT_TYPE(1)
 
         self.channels = num_channels
-        self._norm_count = FLOAT_TYPE(num_channels)
         self.eps = FLOAT_TYPE(eps)
 
         self.gamma = init_zeros_tensor(num_channels, dtype=FLOAT_TYPE) + self._one
@@ -989,6 +974,7 @@ class LayerNorm(Layer):
 
         self.mean = None
         self.var = None
+        self.inv_std = None
         self.std = None
         self.centered = None
         self.normed = None
@@ -997,15 +983,11 @@ class LayerNorm(Layer):
         self.beta, self.beta_grads = self.register(self.beta, dtype=FLOAT_TYPE)
 
     def forward(self, input):
-        if ops.use_kernels(input):
-            self.input = input
-            self.output, self.mean, self.var, self.inv = ops.norm_forward(
-                input, self.gamma, self.beta, (-1,), self.eps,
-                rms=False, stats=None, count=self._norm_count)
-            return self.output
-
-
         self.input = input
+        if ops.use_kernels(input):
+            self.output, self.mean, self.inv_std = ops.layer_norm_forward(
+                input, self.gamma, self.beta, self.eps)
+            return self.output
 
         self.mean = xp.mean(input, axis=-1, keepdims=True)
         self.var  = xp.var(input, axis=-1, keepdims=True)
@@ -1020,20 +1002,17 @@ class LayerNorm(Layer):
 
     def backward(self, gradient):
         if ops.use_kernels(self.input):
-            dx, dg, db = ops.norm_backward(
-                gradient, self.input, self.gamma, self.mean, self.inv,
-                (-1,), tuple(range(gradient.ndim - 1)), rms=False, param_keepdims=False,
-                with_scale=self.gamma_grads is not None, with_bias=True, count=self._norm_count)
+            input_gradient, gamma_grads, beta_grads = ops.layer_norm_backward(
+                gradient, self.input, self.gamma, self.mean, self.inv_std)
             if self.gamma_grads is not None:
-                self.gamma_grads += dg
-            self.beta_grads += db
-            return dx
+                self.gamma_grads += gamma_grads
+            self.beta_grads += beta_grads
+            return input_gradient
 
         
-        B, T, C = gradient.shape
-
-        self.gamma_grads += xp.sum(gradient * self.normed, axis=(0, 1), dtype=FLOAT_TYPE)
-        self.beta_grads  += xp.sum(gradient, axis=(0, 1), dtype=FLOAT_TYPE)
+        axes = tuple(range(gradient.ndim - 1))
+        self.gamma_grads += xp.sum(gradient * self.normed, axis=axes, dtype=FLOAT_TYPE)
+        self.beta_grads  += xp.sum(gradient, axis=axes, dtype=FLOAT_TYPE)
 
         gradient = gradient * self.gamma
         

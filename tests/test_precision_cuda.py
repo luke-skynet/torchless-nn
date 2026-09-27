@@ -12,7 +12,7 @@ pytestmark = pytest.mark.skipif(
     reason='Requires patched CuPy, CUDA SM80+, and XP_PRECISION=bfloat16')
 
 from backend import xp, FLOAT_TYPE, AMP_TYPE, inference_mode, empty_weights
-import precision_ops as ops
+import kernel_ops as ops
 from layers import (RMSNorm, LayerNorm, BatchNorm, RotaryEmbedding, Dense,
                     Convolution, MultiHeadAttention, Softcap, Dropout)
 from activations import ReLU, GeLU, GeLUTanh, SiLU, SoftMax

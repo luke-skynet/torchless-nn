@@ -73,6 +73,30 @@ loading, cached decoding, and a short Gemma training run. GPU correctness and
 throughput must be measured on the target CUDA system; CPU checks do not establish
 GPU correctness or speedups.
 
+BatchNorm uses NCHW-specific split reductions for both CUDA dtypes. Each block
+processes at most 4096 values from one channel; a second stage combines FP32
+Welford statistics. Backward reduces scale/bias gradients together and reuses
+them for input gradients, without separate `dot`/`avg` reductions. Strided views
+are read directly, and scratch storage is two FP32 values per channel/chunk.
+Evaluation uses running statistics without reduction scratch. `kernel_ops.py`
+provides separate BatchNorm, LayerNorm, and RMSNorm forward/backward functions.
+LayerNorm centers inputs and learns a bias; RMSNorm reduces squared inputs
+directly, retains only inverse RMS on CUDA, and supports an optional scale.
+
+Compare against the previous generic shared BatchNorm kernels on the target GPU:
+
+```bash
+XP_RUNTIME=CUDA python -m pytest -q tests/test_batch_norm_cuda.py
+XP_RUNTIME=CUDA python benchmarks/batch_norm.py --dtype both
+# All 20 BatchNorm shapes from the DenseNet demo (default batch size: 512):
+XP_RUNTIME=CUDA python benchmarks/batch_norm.py --dtype both --all-shapes
+```
+
+The benchmark reports training forward, backward, combined forward/backward,
+and evaluation GPU times after warm-up. It excludes unchanged running-statistic
+updates and accumulation into parameter-gradient buffers. It compares the old
+shared kernels with the new split kernels, not the pre-kernel CuPy FP32 path.
+
 ## Attention
 
 Attention supports both plain multi-head and grouped query (GQA), rotary and partial-rotary position embeddings, per-head QK normalization, sliding window attention, and Gemma's shared key/value projection. Calling `MultiHeadAttention` with default arguments keeps the original fused QKV path and parameter layout, so existing checkpoints still load.
@@ -184,7 +208,7 @@ Layers built inside the context allocate no gradient, moment or variance buffers
 * **layers.py** - Convolution, BatchNorm, MaxPool, AveragePool, Flatten, Dense, Dropout, and Transformer (LayerNorm, RMSNorm, Attention, Rotary Embeddings, Gated Feed Forward, Logit Softcap) layers.
 * **gemma.py** - Gemma 4 style model assembly: grouped query attention, QK norm, sandwich norms, interleaved sliding window and global attention, and p-RoPE.
 * **network.py** - Network framework class with Cross Entropy loss criterion and AdamW optimization.
-* **precision_ops.py** - Fused CUDA kernels at BF16/FP32 computation boundaries.
+* **kernel_ops.py** - Shared FP32/BF16 CUDA operations grouped by layer type: separate BatchNorm, LayerNorm, and RMSNorm implementations, activations, softmax, dropout, RoPE, and embeddings.
 * **optimizer.py** - Fused CUDA AdamW updates and the NumPy reference implementation.
 * **transformer_adapters.py** - ViT image to tokens embedding, ViT MLP classification head, GPT embedding and GPT prediction layers.
 * **backend.py** - Array backend selection (CuPy or NumPy), model precision selection, tensor initializers, and the `inference_mode` and `empty_weights` construction contexts.

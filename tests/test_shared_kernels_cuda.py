@@ -7,7 +7,7 @@ import numpy as np
 import pytest
 
 import backend
-import precision_ops as ops
+import kernel_ops as ops
 from activations import ReLU, GeLU, GeLUTanh, SiLU, SoftMax
 from layers import BatchNorm, LayerNorm, RMSNorm, Softcap, RotaryEmbedding, MultiHeadAttention
 
@@ -33,7 +33,10 @@ def close(actual, expected):
     (lambda: SoftMax(.7, fused_loss=True), (2, 3, 37)),
     (lambda: BatchNorm(4), (2, 4, 5, 5)),
     (lambda: LayerNorm(8), (2, 3, 8)),
+    (lambda: LayerNorm(8), (3, 8)),
+    (lambda: LayerNorm(8), (2, 3, 4, 8)),
     (lambda: RMSNorm(8), (2, 3, 8)),
+    (lambda: RMSNorm(8), (2, 3, 2, 5, 8)),
     (lambda: RMSNorm(8, with_scale=False), (2, 3, 8)),
 ])
 def test_forward_backward_reference(monkeypatch, factory, shape):

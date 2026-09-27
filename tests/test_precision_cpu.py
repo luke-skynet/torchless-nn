@@ -89,6 +89,30 @@ def test_norm_backward_finite_difference(norm, shape):
     np.testing.assert_allclose(dx[index], (plus-minus)/(2*eps), atol=2e-3, rtol=1e-2)
 
 
+@pytest.mark.parametrize('norm', [LayerNorm, RMSNorm])
+@pytest.mark.parametrize('shape', [(3, 7), (2, 3, 4, 7)])
+def test_feature_norms_reduce_all_leading_parameter_axes(norm, shape):
+    rng = np.random.default_rng(29)
+    x = (rng.normal(size=shape) + 2).astype(np.float32)
+    g = rng.normal(size=shape).astype(np.float32)
+    layer = norm(shape[-1])
+    layer.gamma[...] = np.linspace(-1, 1, shape[-1])
+    layer.forward(x)
+    dx = layer.backward(g)
+    xf = x.astype(np.float64)
+    centered = xf - xf.mean(-1, keepdims=True) if norm is LayerNorm else xf
+    inv = 1 / np.sqrt((centered * centered).mean(-1, keepdims=True) + layer.eps)
+    normalized = centered * inv
+    scaled_g = g * layer.gamma
+    expected_dx = scaled_g - normalized * (scaled_g * normalized).mean(-1, keepdims=True)
+    if norm is LayerNorm:
+        expected_dx -= scaled_g.mean(-1, keepdims=True)
+    np.testing.assert_allclose(dx, expected_dx * inv, atol=2e-6, rtol=2e-5)
+    np.testing.assert_allclose(layer.gamma_grads,
+                               (g * normalized).sum(tuple(range(x.ndim - 1))),
+                               atol=2e-6, rtol=2e-5)
+
+
 def test_dropout_boolean_masks_and_backward():
     layer = Dropout(.25)
     x = np.ones((100,20),np.float32)

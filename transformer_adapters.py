@@ -1,5 +1,5 @@
 import backend
-import precision_ops as ops
+import kernel_ops as ops
 from backend import xp, FLOAT_TYPE, init_random_tensor, init_zeros_tensor, init_weight_tensor
 
 from utils import Layer
