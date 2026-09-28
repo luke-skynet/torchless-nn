@@ -82,6 +82,23 @@ Evaluation uses running statistics without reduction scratch. `kernel_ops.py`
 provides separate BatchNorm, LayerNorm, and RMSNorm forward/backward functions.
 LayerNorm centers inputs and learns a bias; RMSNorm reduces squared inputs
 directly, retains only inverse RMS on CUDA, and supports an optional scale.
+Both use a fused row-wise CUDA forward kernel for statistics and affine output,
+and a fused row-wise input-gradient kernel. Scale/bias gradients use a separate
+tiled reduction with bounded FP32 scratch; scale-free RMSNorm skips that reduction.
+FP32 and BF16 inputs, mixed gradient storage, and strided views are supported
+without full-sized cast or contiguous copies.
+
+Validate and benchmark the fused LayerNorm/RMSNorm kernels against the previous
+generic reductions on the target GPU:
+
+```bash
+XP_RUNTIME=CUDA python -m pytest -q tests/test_row_norm_cuda.py
+XP_RUNTIME=CUDA python benchmarks/row_norm.py --dtype both
+```
+
+The row-normalization benchmark covers decode, token batches, and strided head
+tensors. It reports forward, backward, and combined times after warm-up, including
+allocation/dispatch but excluding accumulation into layer parameter gradients.
 
 Compare against the previous generic shared BatchNorm kernels on the target GPU:
 

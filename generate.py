@@ -104,7 +104,7 @@ def configure_backend(args):
     cublas = xp.cuda.cublas
     device = xp.cuda.Device(args.device)
     device.use()
-    math_mode = cublas.CUBLAS_TF32_TENSOR_OP_MATH if args.tf32 else cublas.CUBLAS_DEFAULT_MATH
+    math_mode = cublas.CUBLAS_TENSOR_OP_MATH if args.tf32 else cublas.CUBLAS_DEFAULT_MATH
     cublas.setMathMode(device.cublas_handle, math_mode)
     return xp
 

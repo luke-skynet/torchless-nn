@@ -330,69 +330,244 @@ def batch_norm_backward(gradient, input, gamma, mean, inv_std):
     return input_gradient, gamma_grads, beta_grads
 
 
-# layer normalization
+# layer and RMS normalization
+
+# One block per row for statistics/affine and input gradients. Parameter gradients
+# reduce along the other axis, using coalesced column tiles and bounded scratch.
+_ROW_NORM_BLOCK_SIZE = 256
+_ROW_NORM_MAX_PARTIALS = 128
+_ROW_NORM_SOURCE = r'''
+#include <cuda_bf16.h>
+#define CENTERED IS_CENTERED
+#define BLOCK_SIZE 256
+
+// All threads call this together. The final barrier also makes scratch reusable.
+__device__ float row_sum(float v, float* scratch) {
+    scratch[threadIdx.x] = v;
+    __syncthreads();
+    for (int s = BLOCK_SIZE / 2; s; s /= 2) {
+        if (threadIdx.x < s) scratch[threadIdx.x] += scratch[threadIdx.x + s];
+        __syncthreads();
+    }
+    float result = scratch[0];
+    __syncthreads();
+    return result;
+}
+
+ROW_OFFSET_FUNCTION
+
+extern "C" __global__ void row_norm_forward(
+    const INPUT* x, const float* gamma, const float* beta, INPUT* y,
+    float* mean, float* inv, long long width, float eps, float scalar_gamma
+    LAYOUT_ARGS) {
+    long long row = blockIdx.x, xb = X_ROW;
+    __shared__ float scratch[BLOCK_SIZE];
+    float m = 0.f;
+    if (CENTERED) {
+        // Shift before summation to avoid losing small variations on large offsets.
+        float anchor = float(x[xb]), sum = 0.f;
+        for (long long d = threadIdx.x; d < width; d += BLOCK_SIZE)
+            sum += float(x[xb + d * X_STEP]) - anchor;
+        m = anchor + row_sum(sum, scratch) / float(width);
+    }
+    float squares = 0.f;
+    for (long long d = threadIdx.x; d < width; d += BLOCK_SIZE) {
+        float v = float(x[xb + d * X_STEP]) - m;
+        squares += v * v;
+    }
+    float r = 1.f / sqrtf(row_sum(squares, scratch) / float(width) + eps);
+    if (threadIdx.x == 0) {
+        if (CENTERED) mean[row] = m;
+        inv[row] = r;
+    }
+    for (long long d = threadIdx.x; d < width; d += BLOCK_SIZE) {
+        float scale = gamma ? gamma[d] : scalar_gamma;
+        float v = (float(x[xb + d * X_STEP]) - m) * r;
+        y[row * width + d] = INPUT(v * scale + (CENTERED ? beta[d] : 0.f));
+    }
+}
+
+extern "C" __global__ void row_norm_backward(
+    const INPUT* x, const GRADIENT* g, const float* gamma,
+    const float* mean, const float* inv, INPUT* dx,
+    long long width, float scalar_gamma LAYOUT_ARGS) {
+    long long row = blockIdx.x, xb = X_ROW, gb = G_ROW;
+    __shared__ float scratch[BLOCK_SIZE];
+    float m = CENTERED ? mean[row] : 0.f, r = inv[row];
+    float sum = 0.f, dot = 0.f;
+    for (long long d = threadIdx.x; d < width; d += BLOCK_SIZE) {
+        float v = (float(x[xb + d * X_STEP]) - m) * r;
+        float grad = float(g[gb + d * G_STEP]) * (gamma ? gamma[d] : scalar_gamma);
+        sum += grad;
+        dot += grad * v;
+    }
+    float avg = 0.f;
+    if (CENTERED) avg = row_sum(sum, scratch) / float(width);
+    dot = row_sum(dot, scratch) / float(width);
+    for (long long d = threadIdx.x; d < width; d += BLOCK_SIZE) {
+        float v = (float(x[xb + d * X_STEP]) - m) * r;
+        float grad = float(g[gb + d * G_STEP]) * (gamma ? gamma[d] : scalar_gamma);
+        dx[row * width + d] = INPUT((grad - avg - v * dot) * r);
+    }
+}
+
+extern "C" __global__ void row_norm_params_partial(
+    const INPUT* x, const GRADIENT* g, const float* mean, const float* inv,
+    float* dg, float* db, long long width, long long rows,
+    long long rows_per_chunk LAYOUT_ARGS) {
+    long long d = (long long)blockIdx.x * BLOCK_SIZE + threadIdx.x;
+    if (d >= width) return;
+    long long end = ((long long)blockIdx.y + 1) * rows_per_chunk;
+    if (end > rows) end = rows;
+    float gamma_sum = 0.f, beta_sum = 0.f;
+    for (long long row = (long long)blockIdx.y * rows_per_chunk; row < end; ++row) {
+        long long xb = X_ROW, gb = G_ROW;
+        float grad = float(g[gb + d * G_STEP]);
+        float m = CENTERED ? mean[row] : 0.f;
+        gamma_sum += grad * ((float(x[xb + d * X_STEP]) - m) * inv[row]);
+        if (CENTERED) beta_sum += grad;
+    }
+    long long out = (long long)blockIdx.y * width + d;
+    dg[out] = gamma_sum;
+    if (CENTERED) db[out] = beta_sum;
+}
+
+extern "C" __global__ void row_norm_params_finish(
+    const float* partial_gamma, const float* partial_beta,
+    float* dg, float* db, long long width, long long chunks) {
+    long long d = (long long)blockIdx.x * BLOCK_SIZE + threadIdx.x;
+    if (d >= width) return;
+    float gamma_sum = 0.f, beta_sum = 0.f;
+    for (long long chunk = 0; chunk < chunks; ++chunk) {
+        gamma_sum += partial_gamma[chunk * width + d];
+        if (CENTERED) beta_sum += partial_beta[chunk * width + d];
+    }
+    dg[d] = gamma_sum;
+    if (CENTERED) db[d] = beta_sum;
+}
+'''
+
+
+@lru_cache(None)
+def _row_norm_module(input_bf16, gradient_bf16, centered, ndim,
+                     input_contiguous, gradient_contiguous):
+    # Pass shape/strides by value, avoiding device metadata allocations and copies.
+    # Specialize on rank and contiguity, never on shape, so variable token lengths
+    # reuse compiled kernels. Negative and broadcast strides remain supported.
+    sizes = [f'long long n{i}' for i in range(ndim - 1)]
+    strides = [f'long long s{i}' for i in range(ndim - 1)]
+    offset = ['long long result = 0;']
+    for i in reversed(range(ndim - 1)):
+        offset.append(f'result += (row % n{i}) * s{i}; row /= n{i};')
+    signature = ', '.join(['long long row'] + sizes + strides)
+    helper = f'__device__ long long row_offset({signature}) {{' + ''.join(offset) + 'return result;}'
+    layout = sizes + [f'long long {prefix}{i}' for prefix in ('x', 'g') for i in range(ndim)]
+    source = _ROW_NORM_SOURCE.replace('ROW_OFFSET_FUNCTION', helper)
+    source = source.replace('LAYOUT_ARGS', ', ' + ', '.join(layout))
+    for prefix, contiguous in (('x', input_contiguous), ('g', gradient_contiguous)):
+        args = ['row'] + [f'n{i}' for i in range(ndim - 1)] + [f'{prefix}{i}' for i in range(ndim - 1)]
+        source = source.replace(prefix.upper() + '_ROW',
+                                'row * width' if contiguous else 'row_offset(' + ', '.join(args) + ')')
+        source = source.replace(prefix.upper() + '_STEP', '1' if contiguous else f'{prefix}{ndim - 1}')
+    source = source.replace('IS_CENTERED', str(int(centered)))
+    source = source.replace('INPUT', '__nv_bfloat16' if input_bf16 else 'float')
+    source = source.replace('GRADIENT', '__nv_bfloat16' if gradient_bf16 else 'float')
+    return xp.RawModule(code=source, options=('--std=c++11',))
+
+
+def _row_norm_layout(input, gradient=None, centered=False):
+    if input.ndim < 1 or input.shape[-1] == 0:
+        raise ValueError('Normalization kernels require a nonempty last dimension')
+    if not use_kernels(input):
+        raise TypeError('Normalization kernels require CUDA FP32 or BF16 inputs')
+    gradient = input if gradient is None else gradient
+    if gradient.shape != input.shape or not use_kernels(gradient):
+        raise ValueError('Normalization gradient must match input shape and use FP32 or BF16')
+    module = _row_norm_module(is_bf16(input), is_bf16(gradient), centered,
+                              input.ndim, input.flags.c_contiguous, gradient.flags.c_contiguous)
+    layout = (*map(np.int64, input.shape[:-1]),
+              *_element_strides(input), *_element_strides(gradient))
+    return module, input.shape[-1], input.size // input.shape[-1], layout
+
+
+def _row_norm_scale(gamma, width):
+    if isinstance(gamma, xp.ndarray):
+        if gamma.shape != (width,) or gamma.dtype != np.dtype(FLOAT_TYPE):
+            raise ValueError('Normalization scale must be an FP32 vector matching the last dimension')
+        return xp.ascontiguousarray(gamma), _ONE
+    return np.uint64(0), _float_scalar(gamma)
+
+
+def _row_norm_forward(input, gamma, beta, eps):
+    centered = beta is not None
+    module, width, rows, layout = _row_norm_layout(input, centered=centered)
+    scale, scalar = _row_norm_scale(gamma, width)
+    if centered:
+        if beta.shape != (width,) or beta.dtype != np.dtype(FLOAT_TYPE):
+            raise ValueError('LayerNorm bias must be an FP32 vector matching the last dimension')
+        beta = xp.ascontiguousarray(beta)
+    output = xp.empty(input.shape, dtype=input.dtype)
+    inv = xp.empty(input.shape[:-1] + (1,), dtype=FLOAT_TYPE)
+    mean = xp.empty_like(inv) if centered else None
+    if rows:
+        module.get_function('row_norm_forward')((rows,), (_ROW_NORM_BLOCK_SIZE,),
+            (input, scale, beta if centered else np.uint64(0), output,
+             mean if centered else np.uint64(0), inv, np.int64(width),
+             _float_scalar(eps), scalar, *layout))
+    return output, mean, inv
+
+
+def _row_norm_backward(gradient, input, gamma, mean, inv, with_scale):
+    centered = mean is not None
+    module, width, rows, layout = _row_norm_layout(input, gradient, centered)
+    scale, scalar = _row_norm_scale(gamma, width)
+    mean_arg = mean if centered else np.uint64(0)
+    dx = xp.empty(input.shape, dtype=input.dtype)
+    dg = xp.empty((width,), dtype=FLOAT_TYPE) if with_scale else None
+    db = xp.empty_like(dg) if centered else None
+    if not rows:
+        if dg is not None:
+            dg.fill(0)
+        if db is not None:
+            db.fill(0)
+        return dx, dg, db
+    module.get_function('row_norm_backward')((rows,), (_ROW_NORM_BLOCK_SIZE,),
+        (input, gradient, scale, mean_arg, inv, dx, np.int64(width), scalar, *layout))
+    if with_scale:
+        chunks = min((rows + 127) // 128, _ROW_NORM_MAX_PARTIALS)
+        partial_gamma = xp.empty((chunks, width), dtype=FLOAT_TYPE) if chunks > 1 else dg
+        partial_beta = (xp.empty_like(partial_gamma) if chunks > 1 else db) if centered else np.uint64(0)
+        blocks = (width + _ROW_NORM_BLOCK_SIZE - 1) // _ROW_NORM_BLOCK_SIZE
+        module.get_function('row_norm_params_partial')((blocks, chunks), (_ROW_NORM_BLOCK_SIZE,),
+            (input, gradient, mean_arg, inv, partial_gamma, partial_beta,
+             np.int64(width), np.int64(rows), np.int64((rows + chunks - 1) // chunks), *layout))
+        if chunks > 1:
+            module.get_function('row_norm_params_finish')((blocks,), (_ROW_NORM_BLOCK_SIZE,),
+                (partial_gamma, partial_beta, dg, db if centered else np.uint64(0),
+                 np.int64(width), np.int64(chunks)))
+    return dx, dg, db
+
 
 def layer_norm_forward(input, gamma, beta, eps):
-    """Normalize the last dimension; cache its mean and inverse deviation."""
-    count = FLOAT_TYPE(input.shape[-1])
-    mean = _reduce('T x', 'float(x)', 'layer_norm_sum')(
-        input, axis = -1, keepdims = True) / count
-    variance = _reduce('T x, float32 mean', '(float(x)-mean)*(float(x)-mean)',
-                      'layer_norm_variance')(input, mean, axis = -1, keepdims = True) / count
-    inv_std = _ONE / xp.sqrt(variance + _float_scalar(eps))
-    return _centered_affine(input, gamma, beta, mean, inv_std), mean, inv_std
+    """Fused row statistics and affine output; save FP32 mean/inverse deviation."""
+    return _row_norm_forward(input, gamma, beta, eps)
 
 
 def layer_norm_backward(gradient, input, gamma, mean, inv_std):
-    """LayerNorm has both centered-input and mean-gradient corrections."""
-    count = FLOAT_TYPE(input.shape[-1])
-    param_axes = tuple(range(input.ndim - 1))
-    args = 'G g, T x, float32 mean, float32 inv'
-    gamma_grads = _reduce(args, 'float(g)*(float(x)-mean)*inv', 'layer_norm_dgamma')(
-        gradient, input, mean, inv_std, axis = param_axes)
-    beta_grads = _reduce('G g', 'float(g)', 'layer_norm_dbeta')(gradient, axis = param_axes)
-    args += ', float32 gamma'
-    dot = _reduce(args, 'float(g)*gamma*(float(x)-mean)*inv', 'layer_norm_dot')(
-        gradient, input, mean, inv_std, gamma, axis = -1, keepdims = True) / count
-    avg = _reduce('G g, float32 gamma', 'float(g)*gamma', 'layer_norm_avg')(
-        gradient, gamma, axis = -1, keepdims = True) / count
-    input_gradient = xp.empty_like(input)
-    _elementwise(args + ', float32 dot, float32 avg', 'T dx',
-                 'dx = T((float(g)*gamma - avg - (float(x)-mean)*inv*dot)*inv);',
-                 'layer_norm_backward')(gradient, input, mean, inv_std, gamma, dot, avg, input_gradient)
-    return input_gradient, gamma_grads, beta_grads
+    """Fused input gradients plus a combined scale/bias parameter reduction."""
+    return _row_norm_backward(gradient, input, gamma, mean, inv_std, True)
 
-
-# RMS normalization
 
 def rms_norm_forward(input, gamma, eps):
-    """RMSNorm needs a second moment only, with no mean subtraction or bias."""
-    count = FLOAT_TYPE(input.shape[-1])
-    second_moment = _reduce('T x', 'float(x)*float(x)', 'rms_norm_square_sum')(
-        input, axis = -1, keepdims = True) / count
-    inv_rms = _ONE / xp.sqrt(second_moment + _float_scalar(eps))
-    output = xp.empty_like(input)
-    _elementwise('T x, float32 inv, float32 gamma', 'T y',
-                 'y = T(float(x)*inv*gamma);', 'rms_norm_forward')(input, inv_rms, gamma, output)
-    return output, inv_rms
+    """Fused second moment and scaling, with no centering or bias."""
+    output, _, inv = _row_norm_forward(input, gamma, None, eps)
+    return output, inv
 
 
-def rms_norm_backward(gradient, input, gamma, inv_rms, with_scale = True):
-    """Only the projection onto normalized input is subtracted in RMSNorm."""
-    count = FLOAT_TYPE(input.shape[-1])
-    args = 'G g, T x, float32 inv'
-    gamma_grads = None
-    if with_scale:
-        gamma_grads = _reduce(args, 'float(g)*float(x)*inv', 'rms_norm_dgamma')(
-            gradient, input, inv_rms, axis = tuple(range(input.ndim - 1)))
-    args += ', float32 gamma'
-    dot = _reduce(args, 'float(g)*gamma*float(x)*inv', 'rms_norm_dot')(
-        gradient, input, inv_rms, gamma, axis = -1, keepdims = True) / count
-    input_gradient = xp.empty_like(input)
-    _elementwise(args + ', float32 dot', 'T dx',
-                 'dx = T((float(g)*gamma - float(x)*inv*dot)*inv);',
-                 'rms_norm_backward')(gradient, input, inv_rms, gamma, dot, input_gradient)
-    return input_gradient, gamma_grads
+def rms_norm_backward(gradient, input, gamma, inv_rms, with_scale=True):
+    """Fused input gradients; skip parameter reduction for scale-free RMSNorm."""
+    dx, dg, _ = _row_norm_backward(gradient, input, gamma, None, inv_rms, with_scale)
+    return dx, dg
 
 
 # activations
